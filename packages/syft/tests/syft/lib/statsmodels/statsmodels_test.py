@@ -1,20 +1,18 @@
+# stdlib
+import re
+
 # third party
 import pytest
 
 # syft absolute
 import syft as sy
 
+pd = pytest.importorskip("pandas")
+statsmodels = pytest.importorskip("statsmodels")
+
 
 @pytest.mark.vendor(lib="statsmodels")
 def test_glm(root_client: sy.VirtualMachineClient) -> None:
-
-    # stdlib
-    import re
-
-    # third party
-    import pandas as pd
-    import statsmodels
-
     FAMILY = [
         statsmodels.genmod.families.Binomial,
         statsmodels.genmod.families.Gamma,
@@ -26,9 +24,6 @@ def test_glm(root_client: sy.VirtualMachineClient) -> None:
     ]
 
     UNNECESSARY_STR = r"Time(.*)(?=Pearson)|Date(.*)(?=Deviance)"
-
-    sy.load("pandas")
-    sy.load("statsmodels")
 
     # load data
     url = "https://raw.githubusercontent.com/chemo-wakate/tutorial-6th/master/beginner/data/winequality-red.txt"
