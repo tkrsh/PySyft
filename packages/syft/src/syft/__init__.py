@@ -1,105 +1,158 @@
-"""
-Welcome to the syft package! This package is the primary package for PySyft.
-This package has two kinds of attributes: submodules and convenience functions.
-Submodules are configured in the standard way, but the convenience
-functions exist to allow for a convenient `import syft as sy` to then expose
-the most-used functionalities directly on syft. Note that this way of importing
-PySyft is the strict convention in this codebase. (Do no simply call
-`import syft` and then directly use `syft.<method>`.)
-The syft module is split into two distinct groups of functionality which we casually refer to
-as syft "core" and syft "python". "core" functionality is functionality which is designed
-to be universal across all Syft languages (javascript, kotlin, swift, etc.).
-Syft "python" includes all functionality which by its very nature cannot be
-truly polyglot. Syft "core" functionality includes the following modules:
-* :py:mod:`syft.core.node` - APIs for interacting with remote machines you do not directly control.
-* :py:mod:`syft.core.message` - APIs for serializing messages sent between Client and Node classes.
-* :py:mod:`syft.core.pointer` - Client side API for referring to objects on a Node
-* :py:mod:`syft.core.store` - Server side API for referring to object storage on a node (things pointers point to)
-Syft "python" functionality includes the following modules:
-* :py:mod:`syft.ast` - code generates external library common syntax tree using an allowlist list of methods
-* :py:mod:`syft.typecheck` - automatically checks and enforces Python type hints and the exclusive use of kwargs.
-* :py:mod:`syft.lib` - uses the ast library to dynamically create remote execution APIs for supported Python libs.
-    IMPORTANT: syft.core should be very careful when importing functionality from outside of syft
-    core!!! Since we plan to drop syft core down to a language (such as C++ or Rust)
-    this can create future complications with lower level languages calling
-    higher level ones.
-To begin your education in Syft, continue to the :py:mod:`syft.core.node.vm.vm` module...
-"""
+__version__ = "0.8.4-beta.25"
 
 # stdlib
+import pathlib
 from pathlib import Path
 import sys
 from typing import Any
-from typing import Dict
+from typing import Callable
 
-# third party
-from pkg_resources import DistributionNotFound  # noqa: F401
-from pkg_resources import get_distribution  # noqa: F401
+# relative
+from . import gevent_patch  # noqa: F401
+from .abstract_node import NodeSideType  # noqa: F401
+from .abstract_node import NodeType  # noqa: F401
+from .client.client import connect  # noqa: F401
+from .client.client import login  # noqa: F401
+from .client.client import login_as_guest  # noqa: F401
+from .client.client import register  # noqa: F401
+from .client.deploy import Orchestra  # noqa: F401
+from .client.domain_client import DomainClient  # noqa: F401
+from .client.gateway_client import GatewayClient  # noqa: F401
+from .client.registry import DomainRegistry  # noqa: F401
+from .client.registry import EnclaveRegistry  # noqa: F401
+from .client.registry import NetworkRegistry  # noqa: F401
+from .client.search import Search  # noqa: F401
+from .client.search import SearchResults  # noqa: F401
+from .client.user_settings import UserSettings  # noqa: F401
+from .client.user_settings import settings  # noqa: F401
+from .custom_worker.config import DockerWorkerConfig  # noqa: F401
+from .external import OBLV  # noqa: F401
+from .external import enable_external_lib  # noqa: F401
+from .node.credentials import SyftSigningKey  # noqa: F401
+from .node.domain import Domain  # noqa: F401
+from .node.enclave import Enclave  # noqa: F401
+from .node.gateway import Gateway  # noqa: F401
+from .node.server import serve_node  # noqa: F401
+from .node.server import serve_node as bind_worker  # noqa: F401
+from .node.worker import Worker  # noqa: F401
+from .protocol.data_protocol import bump_protocol_version  # noqa: F401
+from .protocol.data_protocol import check_or_stage_protocol  # noqa: F401
+from .protocol.data_protocol import get_data_protocol  # noqa: F401
+from .protocol.data_protocol import stage_protocol_changes  # noqa: F401
+from .serde import NOTHING  # noqa: F401
+from .serde.deserialize import _deserialize as deserialize  # noqa: F401
+from .serde.serializable import serializable  # noqa: F401
+from .serde.serialize import _serialize as serialize  # noqa: F401
+from .service.action.action_data_empty import ActionDataEmpty  # noqa: F401
+from .service.action.action_object import ActionObject  # noqa: F401
+from .service.action.plan import Plan  # noqa: F401
+from .service.action.plan import planify  # noqa: F401
+from .service.code.user_code import UserCodeStatus  # noqa: F401; noqa: F401
+from .service.code.user_code import syft_function  # noqa: F401; noqa: F401
+from .service.code.user_code import syft_function_single_use  # noqa: F401; noqa: F401
+from .service.data_subject import DataSubjectCreate as DataSubject  # noqa: F401
+from .service.dataset.dataset import Contributor  # noqa: F401
+from .service.dataset.dataset import CreateAsset as Asset  # noqa: F401
+from .service.dataset.dataset import CreateDataset as Dataset  # noqa: F401
+from .service.notification.notifications import NotificationStatus  # noqa: F401
+from .service.policy.policy import CustomInputPolicy  # noqa: F401
+from .service.policy.policy import CustomOutputPolicy  # noqa: F401
+from .service.policy.policy import ExactMatch  # noqa: F401
+from .service.policy.policy import SingleExecutionExactOutput  # noqa: F401
+from .service.policy.policy import UserInputPolicy  # noqa: F401
+from .service.policy.policy import UserOutputPolicy  # noqa: F401
+from .service.project.project import ProjectSubmit as Project  # noqa: F401
+from .service.request.request import SubmitRequest as Request  # noqa: F401
+from .service.response import SyftError  # noqa: F401
+from .service.response import SyftNotReady  # noqa: F401
+from .service.response import SyftSuccess  # noqa: F401
+from .service.user.roles import Roles as roles  # noqa: F401
+from .service.user.user_service import UserService  # noqa: F401
+from .types.twin_object import TwinObject  # noqa: F401
+from .types.uid import UID  # noqa: F401
+from .util import filterwarnings  # noqa: F401
+from .util import jax_settings  # noqa: F401
+from .util import logger  # noqa: F401
+from .util import options  # noqa: F401
+from .util.autoreload import disable_autoreload  # noqa: F401
+from .util.autoreload import enable_autoreload  # noqa: F401
+from .util.telemetry import instrument  # noqa: F401
+from .util.util import autocache  # noqa: F401
+from .util.util import get_root_data_path  # noqa: F401
+from .util.version_compare import make_requires
 
-# syft absolute
-# ASTRACT OBJECT IMPORTS
-from syft.core import common  # noqa: F401
-from syft.core.common import event_loop  # noqa: F401
+LATEST_STABLE_SYFT = "0.8.3"
+requires = make_requires(LATEST_STABLE_SYFT, __version__)
 
-# Convenience Methods
-from syft.core.common.serde.deserialize import _deserialize as deserialize  # noqa: F401
-from syft.core.common.serde.serialize import _serialize as serialize  # noqa: F401
-from syft.core.node.common.service.repr_service import ReprMessage  # noqa: F401
-from syft.core.node.device.device import Device  # noqa: F401
-from syft.core.node.device.device import DeviceClient  # noqa: F401
-from syft.core.node.domain.domain import Domain  # noqa: F401
-from syft.core.node.domain.domain import DomainClient  # noqa: F401
-from syft.core.node.network.network import Network  # noqa: F401
-from syft.core.node.network.network import NetworkClient  # noqa: F401
 
-# Convenience Constructors
-from syft.core.node.vm.vm import VirtualMachine  # noqa: F401
-from syft.core.node.vm.vm import VirtualMachineClient  # noqa: F401
-from syft.core.plan.plan import Plan  # noqa: F401
-from syft.core.plan.plan_builder import make_plan  # noqa: F401
-from syft.grid.client.client import login  # noqa: F401
-
-# Convenience Functions
-from syft.grid.duet import bcolors  # noqa: F401
-from syft.grid.duet import duet  # noqa: F401
-from syft.grid.duet import join_duet  # noqa: F401
-from syft.grid.duet import launch_duet  # noqa: F401
-
-# Convenience Objects
-from syft.lib import lib_ast  # noqa: F401
-from syft.lib import load  # noqa: F401
-from syft.lib import load_lib  # noqa: F401
-from syft.lib.torch.module import Module  # noqa: F401
-from syft.lib.torch.module import SyModule  # noqa: F401
-from syft.lib.torch.module import SySequential  # noqa: F401
-
-# syft relative
-# Package Imports
-from . import lib  # noqa: F401
-from . import logger  # noqa: F401
-
-if sys.version_info[:2] >= (3, 8):
-    # TODO: Import directly (no need for conditional) when `python_requires = >= 3.8`
-    # stdlib
-    from importlib.metadata import PackageNotFoundError  # pragma: no cover
-    from importlib.metadata import version
-else:
-    # third party
-    from importlib_metadata import PackageNotFoundError  # pragma: no cover
-    from importlib_metadata import version
-
-try:
-    # Change here if project is renamed and does not equal the package name
-    dist_name = __name__
-    __version__ = version(dist_name)
-except PackageNotFoundError:  # pragma: no cover
-    __version__ = "unknown"
-finally:
-    del version, PackageNotFoundError
+# SYFT_PATH = path = os.path.abspath(a_module.__file__)
+SYFT_PATH = pathlib.Path(__file__).parent.resolve()
 
 sys.path.append(str(Path(__file__)))
 
-logger.add(sink=sys.stderr, level="CRITICAL")
+logger.start()
 
-# TODO: remove this requirement in pytorch lightning
-client_cache: Dict[str, Any] = {}
+try:
+    get_ipython()  # noqa: F821
+    # TODO: add back later or auto detect
+    # display(
+    #     Markdown(
+    #         "\nWarning: syft is imported in light mode by default. \
+    #     \nTo switch to dark mode, please run `sy.options.color_theme = 'dark'`"
+    #     )
+    # )
+except:  # noqa: E722
+    pass  # nosec
+
+# For server-side, to enable by environment variable
+if OBLV:
+    enable_external_lib("oblv")
+
+
+def module_property(func: Any) -> Callable:
+    """Decorator to turn module functions into properties.
+    Function names must be prefixed with an underscore."""
+    module = sys.modules[func.__module__]
+
+    def base_getattr(name: str) -> None:
+        raise AttributeError(f"module {module.__name__!r} has no attribute {name!r}")
+
+    old_getattr = getattr(module, "__getattr__", base_getattr)
+
+    def new_getattr(name: str) -> Any:
+        if f"_{name}" == func.__name__:
+            return func()
+        else:
+            return old_getattr(name)
+
+    module.__getattr__ = new_getattr  # type: ignore
+    return func
+
+
+@module_property
+def _gateways() -> NetworkRegistry:
+    return NetworkRegistry()
+
+
+@module_property
+def _enclaves() -> EnclaveRegistry:
+    return EnclaveRegistry()
+
+
+@module_property
+def _domains() -> DomainRegistry:
+    return DomainRegistry()
+
+
+@module_property
+def _settings() -> UserSettings:
+    return settings
+
+
+@module_property
+def _orchestra() -> Orchestra:
+    return Orchestra
+
+
+def search(name: str) -> SearchResults:
+    return Search(_domains()).search(name=name)

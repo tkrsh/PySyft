@@ -1,180 +1,155 @@
 # stdlib
-import logging
-from multiprocessing import Process
-import socket
-from time import time
-from typing import Any as TypeAny
-from typing import Dict as TypeDict
-from typing import Generator
-from typing import List as TypeList
+import json
+import os
+from pathlib import Path
+from unittest import mock
 
 # third party
-import _pytest
+from faker import Faker
 import pytest
 
 # syft absolute
 import syft as sy
-from syft import logger
-from syft.grid.example_nodes.network import signaling_server as start_signaling_server
-from syft.lib import VendorLibraryImportException
-from syft.lib import _load_lib
-from syft.lib import vendor_requirements_available
+from syft.client.domain_client import DomainClient
+from syft.node.worker import Worker
+from syft.protocol.data_protocol import get_data_protocol
+from syft.protocol.data_protocol import protocol_release_dir
+from syft.protocol.data_protocol import stage_protocol_changes
 
-# syft relative
-from .syft.notebooks import free_port
-
-logger.remove()
-
-
-@pytest.fixture(scope="session")
-def signaling_server() -> Generator:
-    port = free_port()
-    proc = Process(target=start_signaling_server, args=(port, "127.0.0.1"))
-
-    proc.start()
-    start = time()
-
-    while time() - start < 15:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", port)) == 0:
-                break
-    else:
-        raise TimeoutError("Can't connect to the signaling server")
-
-    yield port
-
-    proc.terminate()
+# relative
+from .syft.stores.store_fixtures_test import dict_action_store  # noqa: F401
+from .syft.stores.store_fixtures_test import dict_document_store  # noqa: F401
+from .syft.stores.store_fixtures_test import dict_queue_stash  # noqa: F401
+from .syft.stores.store_fixtures_test import dict_store_partition  # noqa: F401
+from .syft.stores.store_fixtures_test import mongo_action_store  # noqa: F401
+from .syft.stores.store_fixtures_test import mongo_document_store  # noqa: F401
+from .syft.stores.store_fixtures_test import mongo_queue_stash  # noqa: F401
+from .syft.stores.store_fixtures_test import mongo_server_mock  # noqa: F401
+from .syft.stores.store_fixtures_test import mongo_store_partition  # noqa: F401
+from .syft.stores.store_fixtures_test import sqlite_action_store  # noqa: F401
+from .syft.stores.store_fixtures_test import sqlite_document_store  # noqa: F401
+from .syft.stores.store_fixtures_test import sqlite_queue_stash  # noqa: F401
+from .syft.stores.store_fixtures_test import sqlite_store_partition  # noqa: F401
+from .syft.stores.store_fixtures_test import sqlite_workspace  # noqa: F401
 
 
-@pytest.fixture
-def caplog(caplog: _pytest.logging.LogCaptureFixture) -> Generator:
-    class PropogateHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            logging.getLogger(record.name).handle(record)
-
-    logger.add(PropogateHandler())
-    yield caplog
-    logger.remove()
+@pytest.fixture()
+def faker():
+    return Faker()
 
 
-def pytest_addoption(parser: _pytest.config.argparsing.Parser) -> None:
-    parser.addoption(
-        "--runslow", action="store_true", default=False, help="run slow tests"
-    )
+def patch_protocol_file(filepath: Path):
+    dp = get_data_protocol()
+    original_protocol = dp.read_json(dp.file_path)
+    filepath.write_text(json.dumps(original_protocol))
 
 
-def pytest_configure(config: _pytest.config.Config) -> None:
-    config.addinivalue_line("markers", "slow: mark test as slow to run")
-    config.addinivalue_line("markers", "fast: mark test as fast to run")
-    config.addinivalue_line("markers", "all: all tests")
-    config.addinivalue_line("markers", "asyncio: mark test as asyncio")
-    config.addinivalue_line("markers", "vendor: mark test as vendor library")
-    config.addinivalue_line("markers", "libs: runs valid vendor tests")
-    config.addinivalue_line("markers", "benchmark: runs benchmark tests")
-    config.addinivalue_line("markers", "torch: runs torch tests")
-    config.addinivalue_line("markers", "duet: runs duet notebook integration tests")
-    config.addinivalue_line("markers", "grid: runs grid tests")
+def remove_file(filepath: Path):
+    filepath.unlink(missing_ok=True)
 
 
-def pytest_collection_modifyitems(
-    config: _pytest.config.Config, items: TypeList[TypeAny]
-) -> None:
-    # $ pytest -m fast for the fast tests
-    # $ pytest -m slow for the slow tests
-    # $ pytest -m all for all the tests
-    # $ pytest -m libs for the vendor tests
-
-    slow_tests = pytest.mark.slow
-    fast_tests = pytest.mark.fast
-    duet_tests = pytest.mark.duet
-    grid_tests = pytest.mark.grid
-    all_tests = pytest.mark.all
-
-    # dynamically filtered vendor lib tests
-    # there isn't any way to remove "vendor" so the only way to filter
-    # these tests is to add a different tag called "libs" and then run
-    # the tests against that dynamic keyword
-    vendor_tests = pytest.mark.libs  # note libs != vendor
-    loaded_libs: TypeDict[str, bool] = {}
-    vendor_skip = pytest.mark.skip(reason="vendor requirements not met")
-    for item in items:
-        if item.location[0].startswith("PyGrid"):
-            # Ignore if PyGrid folder checked out in main dir
-            continue
-
-        if "grid" in item.keywords:
-            item.add_marker(grid_tests)
-            continue
-        # mark with: pytest.mark.vendor
-        # run with: pytest -m libs -n auto 0
-        if "vendor" in item.keywords:
-            vendor_requirements = item.own_markers[0].kwargs
-
-            # try to load the lib first and if it fails just skip
-            if "lib" in vendor_requirements:
-                lib_name = vendor_requirements["lib"]
-                if lib_name not in loaded_libs:
-                    try:
-                        _load_lib(lib=lib_name)
-                        loaded_libs[lib_name] = True
-                    except Exception as e:
-                        print(f"Failed to load {lib_name}. {e}")
-                        loaded_libs[lib_name] = False
-                if not loaded_libs[lib_name]:
-                    item.add_marker(vendor_skip)
-                    continue
-
-            try:
-                # test the vendor requirements of the specific test if the library
-                # was loaded successfully
-                if vendor_requirements_available(
-                    vendor_requirements=vendor_requirements
-                ):
-                    if item.location[0].startswith("tests/syft/notebooks"):
-                        item.add_marker(duet_tests)
-                    else:
-                        item.add_marker(vendor_tests)
-                    item.add_marker(all_tests)
-
-            except VendorLibraryImportException as e:
-                print(e)
-            except Exception as e:
-                print(f"Unable to check vendor library: {vendor_requirements}. {e}")
-            continue
-
-        if "benchmark" in item.keywords:
-            continue
-
-        if "torch" in item.keywords:
-            item.add_marker(all_tests)
-            continue
-
-        item.add_marker(all_tests)
-        if "slow" in item.keywords:
-            item.add_marker(slow_tests)
-        else:
-            if item.location[0].startswith("tests/syft/notebooks"):
-                item.add_marker(duet_tests)
-                continue
-            # fast is the default catch all
-            item.add_marker(fast_tests)
-
-
-@pytest.fixture(scope="session")
-def node() -> sy.VirtualMachine:
-    return sy.VirtualMachine(name="Bob")
+# Pytest hook to set the number of workers for xdist
+def pytest_xdist_auto_num_workers(config):
+    num = config.option.numprocesses
+    if num == "auto" or num == "logical":
+        return os.cpu_count()
+    return None
 
 
 @pytest.fixture(autouse=True)
-def node_store(node: sy.VirtualMachine) -> None:
-    node.store.clear()
+def protocol_file():
+    random_name = sy.UID().to_string()
+    protocol_dir = sy.SYFT_PATH / "protocol"
+    file_path = protocol_dir / f"{random_name}.json"
+    patch_protocol_file(filepath=file_path)
+    yield file_path
+    remove_file(filepath=file_path)
 
 
-@pytest.fixture(scope="session")
-def client(node: sy.VirtualMachine) -> sy.VirtualMachineClient:
-    return node.get_client()
+@pytest.fixture(autouse=True)
+def stage_protocol(protocol_file: Path):
+    with mock.patch(
+        "syft.protocol.data_protocol.PROTOCOL_STATE_FILENAME",
+        protocol_file.name,
+    ):
+        dp = get_data_protocol()
+        stage_protocol_changes()
+        # bump_protocol_version()
+        yield dp.protocol_history
+        dp.revert_latest_protocol()
+        dp.save_history(dp.protocol_history)
+
+        # Cleanup release dir, remove unused released files
+        for _file_path in protocol_release_dir().iterdir():
+            for version in dp.read_json(_file_path):
+                if version not in dp.protocol_history.keys():
+                    _file_path.unlink()
 
 
-@pytest.fixture(scope="session")
-def root_client(node: sy.VirtualMachine) -> sy.VirtualMachineClient:
-    return node.get_root_client()
+@pytest.fixture()
+def worker(faker) -> Worker:
+    return sy.Worker.named(name=faker.name())
+
+
+@pytest.fixture()
+def root_domain_client(worker) -> DomainClient:
+    return worker.root_client
+
+
+@pytest.fixture()
+def root_verify_key(worker):
+    return worker.root_client.credentials.verify_key
+
+
+@pytest.fixture()
+def guest_client(worker) -> DomainClient:
+    return worker.guest_client
+
+
+@pytest.fixture()
+def guest_verify_key(worker):
+    return worker.guest_client.credentials.verify_key
+
+
+@pytest.fixture()
+def guest_domain_client(root_domain_client) -> DomainClient:
+    return root_domain_client.guest()
+
+
+@pytest.fixture()
+def document_store(worker):
+    yield worker.document_store
+    worker.document_store.reset()
+
+
+@pytest.fixture()
+def action_store(worker):
+    return worker.action_store
+
+
+__all__ = [
+    "mongo_store_partition",
+    "mongo_server_mock",
+    "mongo_document_store",
+    "mongo_queue_stash",
+    "mongo_action_store",
+    "sqlite_store_partition",
+    "sqlite_workspace",
+    "sqlite_document_store",
+    "sqlite_queue_stash",
+    "sqlite_action_store",
+    "dict_store_partition",
+    "dict_action_store",
+    "dict_document_store",
+    "dict_queue_stash",
+]
+
+pytest_plugins = [
+    "tests.syft.users.fixtures",
+    "tests.syft.settings.fixtures",
+    "tests.syft.request.fixtures",
+    "tests.syft.dataset.fixtures",
+    "tests.syft.notifications.fixtures",
+    "tests.syft.action_graph.fixtures",
+    "tests.syft.serde.fixtures",
+]
