@@ -1,0 +1,51 @@
+[project]
+name = "syft-enclave"
+version = "0.1.3"
+description = "TEE attestation server for syft"
+readme = "README.md"
+authors = [{ name = "OpenMined", email = "info@openmined.org" }]
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+
+dependencies = [
+    "syft>=0.10.0",  # floor: the `syft` PyPI project also hosts legacy PySyft <=0.9
+    "syft-rds>=0.6.2",
+    "syft-job>=0.1.41",  # imported directly for logging_config
+    "pydantic-settings>=2.11.0",
+    "requests>=2.32.0",
+    "google-auth[pyjwt]>=2.22.0",
+]
+
+# Verifying Tinfoil attestation evidence. Optional because the SDK pulls in
+# openai, sigstore and pyopenssl, which an enclave deployed on Confidential
+# Space has no use for. The enclave container never needs it either — it reads
+# its own evidence from a file and never verifies itself.
+[project.optional-dependencies]
+tinfoil = [
+    "tinfoil>=0.14.0",
+    "pyyaml>=6.0",  # reading the measured tinfoil-config.yml
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+"syft" = { workspace = true }
+"syft-rds" = { workspace = true }
+"syft-job" = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/syft_enclaves"]
+
+# Explicit sdist file selection: don't rely on Git-based VCS ignore detection,
+# which misbehaves in this repo's git-worktree checkout and otherwise pulls in
+# local Terraform state/provider binaries (multi-hundred-MB) into the sdist.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/syft_enclaves",
+    "tests",
+    "README.md",
+    "LICENSE",
+]
+

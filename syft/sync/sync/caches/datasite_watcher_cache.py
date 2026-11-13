@@ -1,0 +1,540 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Set
+from syft.sync.sync.caches.cache_file_writer_connection import FSFileConnection
+from pathlib import Path
+from pydantic import BaseModel, Field
+from datetime import datetime, timedelta
+from syft.sync.events.file_change_event import (
+    FileChangeEvent,
+    FileChangeEventsMessage,
+    FileChangeEventsMessageFileName,
+)
+from syft.sync.connections.connection_router import ConnectionRouter
+from syft.sync.sync.caches.cache_file_writer_connection import (
+    CacheFileConnection,
+    InMemoryCacheFileConnection,
+)
+from syft.sync.sync.collection_spec import CollectionSyncSpec
+
+logger = logging.getLogger(__name__)
+
+
+def _is_within_peer_datasite(event: FileChangeEvent, peer_email: str) -> bool:
+    """Whether ``event`` targets a file under ``<syftbox>/<peer_email>/``.
+
+    The email is compared without case, as elsewhere. The path must stay
+    inside the mirror: the file connection only guards the syftbox root, so a
+    ``..`` segment could still reach another datasite's folder.
+    """
+    if event.datasite_email.casefold() != peer_email.casefold():
+        return False
+    path = event.path_in_datasite
+    return not path.is_absolute() and ".." not in path.parts
+
+
+def _peer_key(email: str) -> str:
+    """``email`` without case, as peers' emails are compared elsewhere."""
+    return email.casefold()
+
+
+def _sent_at(msg_id: str) -> float:
+    """The send time in the name of an events message."""
+    return FileChangeEventsMessageFileName.from_string(msg_id).timestamp
+
+
+def _events_within_peer_datasite(
+    events: List[FileChangeEvent], peer_email: str
+) -> List[FileChangeEvent]:
+    """The events of ``events`` that target ``peer_email``'s datasite; log the rest."""
+    accepted = []
+    for event in events:
+        if _is_within_peer_datasite(event, peer_email):
+            accepted.append(event)
+        else:
+            logger.warning(
+                f"Dropping event from {peer_email} aimed at "
+                f"{event.path_in_syftbox}: a peer may only change files "
+                "under its own datasite"
+            )
+    return accepted
+
+
+SECONDS_BEFORE_SYNCING_DOWN = 0
+
+
+class DataSiteWatcherCacheConfig(BaseModel):
+    email: str = ""
+    use_in_memory_cache: bool = True
+    syftbox_folder: Path | None = None
+    events_base_path: Path | None = None
+    # Collections to sync down (prefix + local subpath per collection type)
+    collection_specs: list[CollectionSyncSpec] = []
+
+
+class DataSiteWatcherCache(BaseModel):
+    events_connection: CacheFileConnection = Field(
+        default_factory=InMemoryCacheFileConnection
+    )
+
+    file_connection: CacheFileConnection = Field(
+        default_factory=InMemoryCacheFileConnection
+    )
+
+    file_hashes: Dict[str, int] = {}
+    current_check_point: str = None
+    connection_router: ConnectionRouter
+    last_sync: datetime | None = None
+    seconds_before_syncing_down: int = SECONDS_BEFORE_SYNCING_DOWN
+    peers: List[str] = []
+    # The msg_id of the newest events message received from each peer, keyed
+    # by ``_peer_key``.
+    last_msg_id_per_peer: Dict[str, str] = {}
+    # The msg_id of each events message received. The connection lists back a
+    # bit before the last one for late messages, and skips these.
+    received_msg_ids: Set[str] = set()
+    # Base syftbox folder
+    syftbox_folder: Path | None = None
+    # Collections to sync down (prefix + local subpath per collection type)
+    collection_specs: list[CollectionSyncSpec] = []
+    # Cache of collection hashes: path -> content_hash
+    collection_hashes: Dict[Path, str] = {}
+    # Optional pre-write filter: (path_in_syftbox, is_delete) -> allow?
+    # Return True to allow the write, False to deny it.
+    pre_write_filter: Callable[[str, bool], bool] | None = None
+
+    @classmethod
+    def from_config(
+        cls, config: DataSiteWatcherCacheConfig, connection_router: ConnectionRouter
+    ):
+        """``config`` holds plain values only. ``connection_router`` is live and
+        shared with the other parts of the manager, so the caller builds it
+        once and passes it in next to the config (see
+        ``SyftboxManager.from_config``)."""
+        if config.use_in_memory_cache:
+            res = cls(
+                events_connection=InMemoryCacheFileConnection[FileChangeEvent](),
+                file_connection=InMemoryCacheFileConnection[str](),
+                connection_router=connection_router,
+                syftbox_folder=config.syftbox_folder,
+                collection_specs=config.collection_specs,
+            )
+            return res
+        else:
+            if config.syftbox_folder is None:
+                raise ValueError("syftbox_folder is required for non-in-memory cache")
+
+            syftbox_folder_name = Path(config.syftbox_folder).name
+            syftbox_parent = Path(config.syftbox_folder).parent
+            events_folder = syftbox_parent / f"{syftbox_folder_name}-event-messages"
+
+            cache = cls(
+                events_connection=FSFileConnection(
+                    base_dir=events_folder, dtype=FileChangeEventsMessage
+                ),
+                file_connection=FSFileConnection(base_dir=config.syftbox_folder),
+                connection_router=connection_router,
+                syftbox_folder=config.syftbox_folder,
+                collection_specs=config.collection_specs,
+            )
+            cache._load_cached_state()
+            return cache
+
+    def _load_cached_state(self):
+        """Load cached state from disk: file hashes, last messages, and collection hashes."""
+        self._load_saved_messages()
+        self._load_collection_hashes_from_disk()
+
+    def _load_saved_messages(self):
+        """Restore the received messages, last messages and file hashes from
+        the saved events messages, oldest first."""
+        try:
+            saved_messages = self.events_connection.get_all()
+        except Exception:
+            saved_messages = []
+        for events_message in sorted(saved_messages, key=lambda m: m.timestamp):
+            self._restore_received(events_message)
+            self._restore_file_hashes(events_message)
+
+    def _restore_received(self, events_message: FileChangeEventsMessage) -> None:
+        """Record a saved message as received. It does not store its sender, but
+        its events name it: only events for the sender's datasite are saved."""
+        msg_id = events_message.message_filepath.as_string()
+        self.received_msg_ids.add(msg_id)
+        if events_message.events:
+            self._record_received(events_message.events[0].datasite_email, msg_id)
+
+    def _restore_file_hashes(self, events_message: FileChangeEventsMessage) -> None:
+        for event in events_message.events:
+            path_key = Path(event.path_in_syftbox)
+            if event.is_deleted:
+                self.file_hashes.pop(path_key, None)
+            else:
+                self.file_hashes[path_key] = event.new_hash
+
+    def _load_collection_hashes_from_disk(self):
+        """Scan local collection directories and compute hashes to populate collection_hashes."""
+        for collection_path in self._get_local_collection_folders():
+            content_hash = self._compute_local_collection_hash(collection_path)
+            if content_hash:
+                self.collection_hashes[collection_path] = content_hash
+
+    def get_collection_owner_email(self, collection_path: Path) -> str:
+        """Extract the owner email from a collection path."""
+        return collection_path.relative_to(self.syftbox_folder).parts[0]
+
+    def get_collection_path(
+        self, owner_email: str, tag: str, local_subpath: Path
+    ) -> Path | None:
+        """Get the full path to a collection for a given owner, tag and subpath."""
+        if self.syftbox_folder is None:
+            return None
+        return self.syftbox_folder / owner_email / local_subpath / tag
+
+    def _get_local_collection_folders(self):
+        """Yield paths to all local collection folders, in every layout of every spec."""
+        if self.syftbox_folder is None or not self.syftbox_folder.exists():
+            return
+
+        for spec in self.collection_specs:
+            if spec.owner_only:
+                # Owner-only collections (e.g. private data) are never pulled from
+                # peers, so the peer-facing watcher does not track them locally.
+                continue
+            for email_dir in self.syftbox_folder.iterdir():
+                if not email_dir.is_dir() or "@" not in email_dir.name:
+                    continue
+                for layout in spec.layouts:
+                    collections_dir = email_dir / layout.local_subpath
+                    if not collections_dir.exists():
+                        continue
+                    for tag_dir in collections_dir.iterdir():
+                        if tag_dir.is_dir():
+                            yield tag_dir
+
+    def _compute_local_collection_hash(self, collection_path: Path) -> str | None:
+        """Compute content hash from local collection files on disk."""
+        from syft.sync.file_utils import compute_directory_hash
+
+        return compute_directory_hash(collection_path)
+
+    def clear_cache(self):
+        self.events_connection.clear_cache()
+        self.file_connection.clear_cache()
+        self.file_hashes = {}
+        self.last_sync = None
+        self.peers = []
+        self.current_check_point = None
+        self.last_msg_id_per_peer = {}
+        self.received_msg_ids = set()
+        self.collection_hashes = {}
+
+    @property
+    def last_event_timestamp(self) -> float | None:
+        if len(self.events_connection) == 0:
+            return None
+        return self.events_connection.get_latest().timestamp
+
+    def sync_down(self, peer_email: str) -> int:
+        """Apply the events messages of ``peer_email`` not received yet: those
+        after the last one, and any that landed late. Returns the number of
+        events applied. A message that can never be read is passed over, so it
+        does not hold back the later ones."""
+        received = self.connection_router.watcher_receive_events_messages(
+            peer_email,
+            after=self.last_msg_id_per_peer.get(_peer_key(peer_email)),
+            already_received=self.received_msg_ids,
+        )
+        event_count = 0
+        for raw, event_message in received:
+            if event_message is not None:
+                self.apply_event_message(event_message, peer_email)
+                event_count += len(event_message.events)
+            self._record_received(peer_email, raw.msg_id)
+        self.connection_router.mark_all_processed([raw for raw, _ in received])
+
+        self.last_sync = datetime.now()
+        return event_count
+
+    def _record_received(self, peer_email: str, msg_id: str) -> None:
+        """Remember ``msg_id``, and make it ``peer_email``'s last message when
+        it is newer. A message that landed late is older than the last one."""
+        self.received_msg_ids.add(msg_id)
+        key = _peer_key(peer_email)
+        last = self.last_msg_id_per_peer.get(key)
+        if last is None or _sent_at(msg_id) > _sent_at(last):
+            self.last_msg_id_per_peer[key] = msg_id
+
+    def apply_event_message(
+        self, event_message: FileChangeEventsMessage, peer_email: str
+    ) -> None:
+        """Apply the events ``peer_email`` published in its outbox.
+
+        Every event names its own target (``datasite_email`` and
+        ``path_in_datasite``), and both fields come from the peer. A peer may
+        only change files under its own datasite, mirrored locally at
+        ``<syftbox>/<peer_email>/``, so an event aimed anywhere else is dropped
+        before it reaches the local file connection.
+
+        The saved copy of the message holds only the accepted events.
+        ``_load_saved_messages`` reads saved messages back on start,
+        and a saved message does not record its sender, so a dropped event
+        cannot be checked again there.
+        """
+        accepted = _events_within_peer_datasite(event_message.events, peer_email)
+        saved = event_message.model_copy(update={"events": accepted})
+        self.events_connection.write_file(saved.message_filepath.as_string(), saved)
+        for event in accepted:
+            self._apply_event(event)
+
+    def _apply_event(self, event: FileChangeEvent) -> None:
+        path = str(event.path_in_syftbox)
+        if self.pre_write_filter and not self.pre_write_filter(path, event.is_deleted):
+            return
+        # Normalize path to Path object for consistency in file_hashes dict
+        path_key = Path(event.path_in_syftbox)
+        if event.is_deleted:
+            self.file_connection.delete_file(path)
+            self.file_hashes.pop(path_key, None)
+        else:
+            self.file_connection.write_file(path, event.content)
+            self.file_hashes[path_key] = event.new_hash
+
+    def get_cached_events(self) -> List[FileChangeEvent]:
+        messages = self.events_connection.get_all()
+        return [event for message in messages for event in message.events]
+
+    def sync_down_if_needed(self, peer_email: str):
+        if self.last_sync is None:
+            self.sync_down(peer_email)
+
+        time_since_last_sync = datetime.now() - self.last_sync
+        if time_since_last_sync > timedelta(seconds=SECONDS_BEFORE_SYNCING_DOWN):
+            self.sync_down(peer_email)
+
+    def current_hash_for_file(self, path: str) -> int | None:
+        for peer in self.peers:
+            self.sync_down_if_needed(peer)
+        return self.file_hashes.get(path, None)
+
+    def _select_collections_to_sync(
+        self, spec: CollectionSyncSpec, collections: list[dict]
+    ) -> list[dict]:
+        """Keep one collection per tag: the newest layout this client reads.
+
+        An owner publishes a collection once for each layout its audience reads.
+        This client takes the newest of those it reads, and warns about the rest.
+        """
+        best: dict[tuple[str, str], dict] = {}
+        for collection in collections:
+            variant = collection.get("variant", "")
+            if spec.rank_of(variant) < 0:
+                logger.warning(
+                    "Skipping '%s' from %s: it uses the %r layout of %s, which "
+                    "this client does not read.",
+                    collection["tag"],
+                    collection["owner_email"],
+                    variant,
+                    spec.prefix,
+                )
+                continue
+            key = (collection["owner_email"], collection["tag"])
+            current = best.get(key)
+            if current is None or spec.rank_of(variant) > spec.rank_of(
+                current.get("variant", "")
+            ):
+                best[key] = collection
+        return list(best.values())
+
+    def _collection_path_of(self, spec: CollectionSyncSpec, collection: dict):
+        """The local path a listed collection syncs to, or None without a syftbox."""
+        layout = spec.layout_for(collection.get("variant", ""))
+        if layout is None:
+            return None
+        return self.get_collection_path(
+            collection["owner_email"], collection["tag"], layout.local_subpath
+        )
+
+    def _cleanup_stale_collections(
+        self,
+        spec: CollectionSyncSpec,
+        peer_email: str,
+        selected_collections: list[dict],
+        remote_collections: list[dict],
+    ):
+        """Remove local collections this client no longer syncs from a peer.
+
+        Two cases get removed: the owner deleted the collection, and this client
+        now reads a newer layout of it. The second case would otherwise leave the
+        older copy on disk, where a scan finds the same collection twice.
+
+        A collection the owner still publishes, but in no layout this client
+        reads, is kept: the copy on disk is then the last one this client could
+        read. ``_select_collections_to_sync`` already logged why it is not
+        refreshed.
+        """
+        layout_parents = set()
+        if self.syftbox_folder is not None:
+            layout_parents = {
+                self.syftbox_folder / peer_email / layout.local_subpath
+                for layout in spec.layouts
+            }
+        selected_paths = {
+            self._collection_path_of(spec, c) for c in selected_collections
+        }
+        published = {(c["owner_email"], c["tag"]) for c in remote_collections}
+        readable = {(c["owner_email"], c["tag"]) for c in selected_collections}
+
+        for local_collection_path in list(self.collection_hashes.keys()):
+            owner_email = self.get_collection_owner_email(local_collection_path)
+            if owner_email != peer_email:
+                continue
+            # Only consider collections that live under one of this spec's layouts.
+            if layout_parents and local_collection_path.parent not in layout_parents:
+                continue
+            if local_collection_path in selected_paths:
+                continue
+            # The last path segment is the tag, in every layout.
+            collection = (owner_email, local_collection_path.name)
+            if collection in published and collection not in readable:
+                continue
+            del self.collection_hashes[local_collection_path]
+            if self.syftbox_folder is not None:
+                try:
+                    rel_path = local_collection_path.relative_to(self.syftbox_folder)
+                    self.file_connection.delete_directory(str(rel_path))
+                except ValueError:
+                    pass
+
+    def sync_down_collections(self, peer_email: str):
+        """
+        Sync collections from peer across all configured specs.
+        Separate from message sync. Uses hash to skip unchanged collections.
+        """
+        for spec in self.collection_specs:
+            if spec.owner_only:
+                # Never pull owner-only collections (e.g. private data) from a peer.
+                continue
+            # Every layout the peer published; the prefix matches all of them.
+            collections = self.connection_router.watcher_list_collections(spec.prefix)
+
+            # Filter by peer, then take one layout for each collection
+            published = [c for c in collections if c["owner_email"] == peer_email]
+            peer_collections = self._select_collections_to_sync(spec, published)
+
+            self._cleanup_stale_collections(
+                spec, peer_email, peer_collections, published
+            )
+
+            for collection in peer_collections:
+                owner_email = collection["owner_email"]
+                tag = collection["tag"]
+                content_hash = collection["content_hash"]
+                layout = spec.layout_for(collection.get("variant", ""))
+
+                # Check if hash changed - skip download if unchanged
+                collection_path = self.get_collection_path(
+                    owner_email, tag, layout.local_subpath
+                )
+                if collection_path is None:
+                    continue
+                cached_hash = self.collection_hashes.get(collection_path)
+                if cached_hash == content_hash:
+                    continue
+
+                # Download collection files
+                files = self.connection_router.watcher_download_collection(
+                    spec.wire_prefix(layout.variant), tag, content_hash, owner_email
+                )
+
+                # Write files to local cache (path relative to syftbox_folder)
+                for file_name, content in files.items():
+                    rel_path = f"{owner_email}/{layout.local_subpath}/{tag}/{file_name}"
+                    self.file_connection.write_file(rel_path, content)
+
+                # Update hash cache
+                self.collection_hashes[collection_path] = content_hash
+
+    def sync_down_collections_parallel(
+        self,
+        peer_email: str,
+        executor: ThreadPoolExecutor,
+        download_fn: Callable[[str], bytes],
+    ):
+        """
+        Sync collections from peer with parallel file downloads, across all specs.
+        For each spec, downloads all files from all collections in a single
+        parallel batch.
+        """
+        for spec in self.collection_specs:
+            if spec.owner_only:
+                # Never pull owner-only collections (e.g. private data) from a peer.
+                continue
+            collections = self.connection_router.watcher_list_collections(spec.prefix)
+            published = [c for c in collections if c["owner_email"] == peer_email]
+            peer_collections = self._select_collections_to_sync(spec, published)
+
+            self._cleanup_stale_collections(
+                spec, peer_email, peer_collections, published
+            )
+
+            # Gather all files to download across all collections for this spec
+            all_downloads = []  # List of (collection_info, file_metadata)
+            collections_to_update = []
+
+            for collection in peer_collections:
+                owner_email = collection["owner_email"]
+                tag = collection["tag"]
+                content_hash = collection["content_hash"]
+                layout = spec.layout_for(collection.get("variant", ""))
+
+                # Check if hash changed - skip download if unchanged
+                collection_path = self.get_collection_path(
+                    owner_email, tag, layout.local_subpath
+                )
+                if collection_path is None:
+                    continue
+                cached_hash = self.collection_hashes.get(collection_path)
+                if cached_hash == content_hash:
+                    continue
+
+                # Get file metadata (no download yet)
+                file_metadatas = (
+                    self.connection_router.watcher_get_collection_file_metadatas(
+                        spec.wire_prefix(layout.variant),
+                        tag,
+                        content_hash,
+                        owner_email,
+                    )
+                )
+
+                if not file_metadatas:
+                    continue
+
+                collections_to_update.append(collection)
+                for metadata in file_metadatas:
+                    all_downloads.append((collection, metadata))
+
+            if not all_downloads:
+                continue
+
+            # Download all files from all collections in parallel
+            file_ids = [metadata["file_id"] for _, metadata in all_downloads]
+            downloaded_contents = list(executor.map(download_fn, file_ids))
+
+            # Write files to local cache (path relative to syftbox_folder)
+            for (collection, metadata), content in zip(
+                all_downloads, downloaded_contents
+            ):
+                owner_email = collection["owner_email"]
+                tag = collection["tag"]
+                file_name = metadata["file_name"]
+                subpath = spec.layout_for(collection.get("variant", "")).local_subpath
+                rel_path = f"{owner_email}/{subpath}/{tag}/{file_name}"
+                self.file_connection.write_file(rel_path, content)
+
+            # Update hash cache for all collections in this spec
+            for collection in collections_to_update:
+                collection_path = self._collection_path_of(spec, collection)
+                if collection_path is not None:
+                    self.collection_hashes[collection_path] = collection["content_hash"]

@@ -1,0 +1,102 @@
+# syft-enclave
+
+Enclave support for syft, enabling secure computation in Trusted Execution Environments (TEEs).
+
+## About
+
+- [Collaboration Flow](./docs/flow.md)
+- [Security Overview](./docs/security.md)
+- [Enclave Architecture](./docs/enclave_architecture.md)
+- [API](./docs/api.md)
+- [Confidential Spaces Deployment (Terraform)](./docs/terraform_cs.md)
+- [Tinfoil Deployment](./docs/tinfoil_deployment.md)
+- [Tinfoil Troubleshooting](./docs/tinfoil_troubleshooting.md)
+
+## Prerequisites
+
+Shared by both deployment targets:
+
+- Docker with buildx support (Docker Desktop includes this)
+- [`just`](https://github.com/casey/just) and `jq`
+
+For Confidential Spaces (the rest of this README):
+
+- `gcloud` [CLI installed](https://docs.cloud.google.com/sdk/docs/install-sdk)
+- A GCP project with billing enabled
+
+For Tinfoil, see [docs/tinfoil_deployment.md](./docs/tinfoil_deployment.md) — no GCP needed.
+
+All commands are defined in the [`Justfile`](./Justfile). Run them from this directory.
+
+Prefer declarative deploys? The same stack can be managed with Terraform — see [Confidential Spaces Deployment](./docs/terraform_cs.md) (`just tf-apply` / `just tf-apply-dev`).
+
+Deploying without GCP? See [Tinfoil Deployment](./docs/tinfoil_deployment.md) (`just tinfoil-build` / `just tinfoil-release` / `just tinfoil-deploy`), which needs the `tinfoil` CLI instead of `gcloud`. On Tinfoil the data owners are pinned in the measured config instead of set at `init`, and a second config turns on signed job receipts.
+
+## One-time setup
+
+```bash
+just init YOUR_GCLOUD_PROJECT_ID TOKEN_PATH DATA_OWNERS
+```
+
+- `TOKEN_PATH` — credentials of the enclave email downloaded from the gcloud console.
+- `DATA_OWNERS` — comma-separated emails of the data owners whose approval gates every job on this enclave, e.g. `do1@openmined.org,do2@openmined.org`.
+
+This stores settings (including `data_owners`) in `~/.syft-enclaves/settings.json` and sets the active gcloud project. Every other recipe reads `project_id`, `zone`, and `data_owners` from this file — zone is **not** a per-call arg. To deploy in a different zone or change the data owners, re-run `just init YOUR_PROJECT_ID TOKEN_PATH DATA_OWNERS europe-west4-a`.
+
+### Approval model
+
+The data owners configured at `init` are fixed for the enclave: a job runs only after **all** of them approve it, regardless of which datasets the submission references. The emails are passed to the VM as `SYFT_ENCLAVE_DATA_OWNERS` at deploy time and held in memory by the running enclave. To change the approving data owners, re-run `just init` and redeploy.
+
+Each data owner also approves which of the files the DS asked to read go to whom: `approve_job(job, share_files=...)`, or the whole request when `share_files` is left out. The enclave shares a file with a reader only when every data owner approved it for that reader. The outputs are the exception: they always reach the DS.
+
+After a run, the data owners can share a log that nobody approved yet. Each of them calls `request_stderr(job, readers=..., n_chars=...)` or `request_stdout(...)`. When every data owner made the same call, the enclave shares the log, or only its first `n_chars` characters.
+
+## Production deployment
+
+Hardened image — no SSH access, TEE enforcement enabled.
+
+```bash
+just start EMAIL                          # defaults: syft-enclave-vm, n2d-standard-2
+just start EMAIL my-vm n2d-standard-4     # override name / machine type
+just stop [name]                          # Teardown: Deletes the VM (default: syft-enclave-vm)
+```
+
+The first run also provisions APIs and IAM roles (idempotent). No inbound port is opened on the enclave — attestation is published through the peer flow, and all other traffic is outbound.
+
+## Debug deployment
+
+Debug image — SSH enabled, container logs redirected to serial output.
+
+```bash
+just start-debug EMAIL                          # defaults: syft-enclave-vm, n2d-standard-2
+just start-debug EMAIL my-vm n2d-standard-4     # override name / machine type
+just stop [name]                                # Teardown: Deletes the VM.
+```
+
+An enclave always requires encryption, debug enclaves too. Clients select encryption from the enclave policy, so they need no setting.
+
+## GPU deployments
+
+Prefix any deploy with `hardware=gpu` to switch from the CPU default to `a3-highgpu-1g` (1× H100 80GB, Intel TDX):
+
+```bash
+just hardware=gpu start EMAIL           # production
+just hardware=gpu start-debug EMAIL     # debug
+```
+
+GPU enclaves use flex-start provisioning: the create call may wait for H100 capacity (up to 2h), then the VM runs `gpu_run_duration_seconds` (default 2 days). Details: [Confidential Spaces — GPU deployments](docs/terraform_cs.md#gpu-deployments).
+
+## Inspect a running VM
+
+All inspect commands take an optional `name` (default: `syft-enclave-vm`). Zone is always read from `settings.json`.
+
+```bash
+# Works on both production and debug
+just status [name]   # RUNNING / TERMINATED / etc.
+just get-ip [name]   # external IP
+
+# Debug only
+just ssh    [name]   # SSH into the VM (production image disables SSH)
+just logs   [name]   # last 50 lines of serial output (production only shows boot logs;
+                     # debug redirects container logs to serial output)
+```

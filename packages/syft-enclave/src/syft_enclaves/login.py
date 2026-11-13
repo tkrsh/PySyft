@@ -1,0 +1,140 @@
+"""Login helpers for enclave-flow participants."""
+
+from pathlib import Path
+
+from syft.sync.environments.environment import Environment
+from syft.sync.login import (
+    _import_key_file,
+    _init_client_login,
+    _resolve_login_params,
+)
+from syft.sync.login_utils import handle_potential_version_mismatches_on_login
+from syft.sync.utils.syftbox_utils import check_env
+from syft_rds import SyftRDSClientConfig
+
+from syft_enclaves.client import SyftEnclaveClient
+
+
+def _login(
+    *,
+    email: str | None,
+    token_path: str | Path | None,
+    sync: bool,
+    load_peers: bool,
+    skip_peer_on_patch_version_diff: bool | None,
+    has_do_role: bool,
+    has_ds_role: bool,
+    encryption: bool | None = None,
+    key_file: str | Path | None = None,
+) -> SyftEnclaveClient:
+    """Shared login for enclave-flow participants.
+
+    Mirrors ``syft.login_do``: detect the environment, resolve params,
+    run the login-time version-mismatch check, then build the enclave client
+    for Colab or Jupyter — always wrapping the job_client with EnclaveJobClient.
+
+    Keys are persisted per-datasite to
+    ``<syftbox_folder>/<email>/private/crypto_keys.json`` (a stable identity
+    across sessions; never synced to Drive). The client makes them at the
+    first login. ``key_file`` restores the keys of an earlier session: it is
+    copied to that path before the client is built.
+    """
+    env = check_env()
+    email, token_path = _resolve_login_params(email, token_path)
+    repair_pending = handle_potential_version_mismatches_on_login(email, token_path)
+
+    if env == Environment.COLAB:
+        config = SyftRDSClientConfig.for_colab(
+            email=email,
+            has_do_role=has_do_role,
+            has_ds_role=has_ds_role,
+            encryption=encryption,
+            skip_peer_on_patch_version_diff=skip_peer_on_patch_version_diff,
+        )
+    else:
+        config = SyftRDSClientConfig.for_jupyter(
+            email=email,
+            has_do_role=has_do_role,
+            has_ds_role=has_ds_role,
+            token_path=Path(token_path) if token_path is not None else None,
+            encryption=encryption,
+            skip_peer_on_patch_version_diff=skip_peer_on_patch_version_diff,
+        )
+
+    _import_key_file(key_file, config.sync.syftbox_folder, email)
+    client = SyftEnclaveClient.from_config(config)
+
+    # Reuses syft's login init: verifies the token authenticates as
+    # `email`, writes the local version, then syncs / loads peers. Operates on
+    # the generic sync engine nested inside the RDS client.
+    _init_client_login(
+        client._rds.sync_engine,
+        sync=sync,
+        load_peers=load_peers,
+        repair_pending=repair_pending,
+    )
+    return client
+
+
+def login_do(
+    email: str | None = None,
+    token_path: str | Path | None = None,
+    sync: bool = True,
+    load_peers: bool = True,
+    skip_peer_on_patch_version_diff: bool | None = None,
+    encryption: bool | None = None,
+    key_file: str | Path | None = None,
+) -> SyftEnclaveClient:
+    """Log in a data owner for an enclave computation.
+
+    Set ``encryption=True`` to require encryption with every peer, and
+    ``False`` to encrypt only with each peer that requires it, such as an
+    enclave. Without it, the client takes the policy of its SyftBox, or
+    ``False`` on a new one.
+
+    ``key_file`` is the ``crypto_keys.json`` of an earlier session, e.g. an
+    uploaded file on Colab. Without it, the first login makes new keys.
+    """
+    return _login(
+        email=email,
+        token_path=token_path,
+        sync=sync,
+        load_peers=load_peers,
+        skip_peer_on_patch_version_diff=skip_peer_on_patch_version_diff,
+        has_do_role=True,
+        has_ds_role=True,
+        encryption=encryption,
+        key_file=key_file,
+    )
+
+
+def login_ds(
+    email: str | None = None,
+    token_path: str | Path | None = None,
+    sync: bool = True,
+    load_peers: bool = True,
+    skip_peer_on_patch_version_diff: bool | None = None,
+    encryption: bool | None = None,
+    key_file: str | Path | None = None,
+) -> SyftEnclaveClient:
+    """Log in a data scientist for an enclave computation.
+
+    Set ``encryption=True`` to require encryption with every peer, and
+    ``False`` to encrypt only with each peer that requires it, such as an
+    enclave. Without it, the client takes the policy of its SyftBox, or
+    ``False`` on a new one.
+
+    ``key_file`` is the ``crypto_keys.json`` of an earlier session, e.g. an
+    uploaded file on Colab. Without it, the first login makes new keys.
+    """
+    return _login(
+        email=email,
+        token_path=token_path,
+        sync=sync,
+        load_peers=load_peers,
+        skip_peer_on_patch_version_diff=skip_peer_on_patch_version_diff,
+        has_do_role=False,
+        has_ds_role=True,
+        encryption=encryption,
+        key_file=key_file,
+    )

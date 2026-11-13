@@ -1,0 +1,290 @@
+name: CD - Monorepo
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run pre-release tests
+        type: boolean
+        default: true
+
+      bump_type:
+        description: Version bump type
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+      release_syft_restrict:
+        description: Release syft-restrict
+        type: boolean
+        default: true
+
+      release_syft_permissions:
+        description: Release syft-permissions
+        type: boolean
+        default: true
+
+      release_syft_perms:
+        description: Release syft-perms
+        type: boolean
+        default: true
+
+      release_syft_migration:
+        description: Release syft-migration
+        type: boolean
+        default: true
+
+      release_syft_job:
+        description: Release syft-job
+        type: boolean
+        default: true
+
+      release_syft_dataset:
+        description: Release syft-dataset
+        type: boolean
+        default: true
+
+      release_syft_rds:
+        description: Release syft-rds
+        type: boolean
+        default: true
+
+      release_syft_enclave:
+        description: Release syft-enclave
+        type: boolean
+        default: true
+
+      release_syft_bg:
+        description: Release syft-bg
+        type: boolean
+        default: true
+
+concurrency:
+  group: 'CD - Monorepo'
+  cancel-in-progress: false
+
+jobs:
+  # Every job below pushes a bump commit straight to the branch, and the dev
+  # ruleset rejects that push after the upload. Refuse before anything runs.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release only from a release branch
+        run: |
+          case "${{ github.ref }}" in
+            refs/heads/release/*) echo "Releasing from ${{ github.ref_name }}" ;;
+            *) echo "::error::Dispatch the release from a release/vX.Y branch, not ${{ github.ref_name }}"; exit 1 ;;
+          esac
+
+  # The test workflows come from this branch, like the code they test.
+  call-linting-tests:
+    needs: [preflight]
+    if: inputs.run_tests == true
+    uses: ./.github/workflows/ci.yml
+
+  call-unit-tests:
+    needs: [preflight]
+    if: inputs.run_tests == true
+    uses: ./.github/workflows/unit-tests.yml
+
+  call-integration-tests:
+    needs: [preflight]
+    if: inputs.run_tests == true
+    uses: ./.github/workflows/integration-tests.yml
+    secrets: inherit
+
+  # Release order follows the dependency graph. The jobs run one at a time:
+  # each pushes a bump commit, and two pushes from parallel jobs conflict.
+  # 1. syft-restrict (no internal deps)
+  # 2. syft-permissions (no internal deps)
+  # 3. syft-perms (depends on syft-permissions)
+  # 4. syft-migration (no internal deps; needed by dataset + job)
+  # 5. syft-dataset, then syft-job (depend on syft-perms + syft-migration)
+  # 6. syft (root; depends on the packages above, whose jobs rewrote its pins)
+  # 7. syft-rds (depends on syft, syft-job, syft-dataset)
+  # 8. syft-enclave, then syft-bg (depend on syft-rds)
+  # syft goes before the packages that depend on it, so a failure in one of
+  # them does not hold syft back.
+
+  release-syft-restrict:
+    needs:
+      [preflight, call-linting-tests, call-unit-tests, call-integration-tests]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_restrict == true
+    uses: ./.github/workflows/cd-syft-restrict.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-permissions:
+    needs: [release-syft-restrict]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_permissions == true
+    uses: ./.github/workflows/cd-syft-permissions.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-perms:
+    needs: [release-syft-permissions]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_perms == true
+    uses: ./.github/workflows/cd-syft-perms.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-migration:
+    needs: [release-syft-perms]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_migration == true
+    uses: ./.github/workflows/cd-syft-migration.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-dataset:
+    needs: [release-syft-migration]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_dataset == true
+    uses: ./.github/workflows/cd-syft-dataset.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-job:
+    needs: [release-syft-dataset]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_job == true
+    uses: ./.github/workflows/cd-syft-job.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-rds:
+    needs: [deploy-syft]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_rds == true
+    # A called workflow cannot exceed the caller's token permissions, so the
+    # OIDC permission for trusted publishing has to be granted here as well.
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/cd-syft-rds.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-enclave:
+    needs: [release-syft-rds]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_enclave == true
+    uses: ./.github/workflows/cd-syft-enclave.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  release-syft-bg:
+    needs: [release-syft-enclave]
+    if: >-
+      !cancelled() && !failure() &&
+      inputs.release_syft_bg == true
+    uses: ./.github/workflows/cd-syft-bg.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    secrets: inherit
+
+  deploy-syft:
+    needs: [release-syft-job]
+    if: >-
+      !cancelled() && !failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install Just
+        uses: extractions/setup-just@v3
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # The branch already holds the version to release. The bump happens after
+      # the publish, so the version on the branch names an unreleased version
+      - name: Read the version to release
+        run: |
+          # Only this branch and no tags: a bare `git pull` fetches every old
+          git pull --ff-only --no-tags origin "${{ github.ref_name }}"
+          VERSION=$(python3 syft/version.py)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Releasing syft $VERSION"
+
+      # Artifacts live inside the package, so they must be committed before the
+      # build. Re-running the export writes nothing when they already exist.
+      - name: Freeze release artifacts
+        run: |
+          just export-release-artifacts
+          git add syft/migrations/history
+          git diff --cached --quiet || \
+            git commit -m "Freeze syft v${{ env.VERSION }} release artifacts"
+
+      - name: Build
+        run: just build
+
+      - name: Upload to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_PASS_SYFT }}
+        run: uvx twine upload dist/*
+
+      - name: Record the released version
+        id: publish
+        run: echo "version=${{ env.VERSION }}" >> $GITHUB_OUTPUT
+
+      # The tag must name the published version, so it is created before the bump.
+      # Root tags continue the repo's historical vX.Y.Z lineage; sub-packages
+      # use <name>/vX.Y.Z. The tag is annotated and pushed explicitly:
+      # `--follow-tags` only pushes annotated tags, so a lightweight tag would
+      # never reach origin. The bump and the tag are pushed together (--atomic),
+      # so a re-run never finds one without the other.
+      - name: Tag the release, then bump for the next one
+        run: |
+          git tag -a "v${{ env.VERSION }}" -m "syft v${{ env.VERSION }}"
+          just bump ${{ inputs.bump_type }}
+          git push --atomic origin HEAD "refs/tags/v${{ env.VERSION }}"
+
+  # Waits for the last package so the smoke test installs what this run
+  # published, but runs whenever syft itself was published.
+  post-release-tests:
+    needs: [deploy-syft, release-syft-bg]
+    if: >-
+      !cancelled() &&
+      needs.deploy-syft.result == 'success'
+    uses: ./.github/workflows/post-release-tests.yml
+    with:
+      package_version: ${{ needs.deploy-syft.outputs.version }}

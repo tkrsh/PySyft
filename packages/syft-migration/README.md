@@ -1,0 +1,34 @@
+# syft-migration
+
+Versioning and on-the-fly migration foundation for Syft objects.
+
+Lets peers running different package versions exchange data by upgrading or downgrading
+serialized objects to a version the other side understands.
+
+## Building blocks
+
+- `MigratableObject` — base for any versioned object (`canonical_name` + `version`),
+  auto-registers via `__init_subclass__`.
+- `PackageProtocolSchema` — the protocol surface of one release of one package
+  (`protocol_name`, `package_name`, `package_version`, one version per object).
+- `MigrationRegistry` — per-package registry of all object versions, migration edges, and
+  the current + historical protocol schemas.
+- `MigrationService` — upgrades/downgrades objects, including to the version a peer's
+  package version supports.
+- `protocol_version_at_least` — compares two protocol versions as integers, so `"10"` is
+  later than `"2"`. Use it instead of a string or `int()` comparison.
+- `coverage` — checks a package runs against its own registry: `unregistered_objects`
+  finds a versioned object filed into another package's registry, and
+  `missing_upgrade_paths` / `missing_downgrade_paths` find a version that cannot reach
+  latest or cannot reach a lower version. Each returns findings, so empty means covered.
+
+## Docs
+
+- [Object Versions](docs/object-versions.md) — how to add a version to a versioned object, and which migrations the new version needs.
+
+## Dev
+
+```bash
+uv pip install -e packages/syft-migration
+just test-unit-migration
+```

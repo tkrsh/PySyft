@@ -1,0 +1,256 @@
+import random
+import time
+import uuid
+from pathlib import Path
+from typing import List
+
+from syft.sync.connections.drive import gdrive_retry
+from syft.sync.connections.drive.mock_drive_service import MockListRequest
+from syft.sync.events.file_change_event import (
+    FileChangeEvent,
+    FileChangeEventsMessage,
+    FileChangeEventsMessageFileName,
+)
+from syft.sync.messages.proposed_filechange import (
+    ProposedFileChange,
+    ProposedFileChangesMessage,
+)
+from syft.sync.utils.syftbox_utils import get_event_hash_from_content
+from syft.sync.connections.connection_router import ConnectionRouter
+from syft.sync.connections.drive.mock_drive_service import pair_with_mock_service
+from syft.sync.peers.peer_store import PeerStore
+from syft.sync.syftbox_manager import SyftboxManager
+
+
+def fail_next_listing(monkeypatch, name_prefix: str) -> None:
+    """Make the next mock Drive listing of files named ``name_prefix`` fail once,
+    with an error the Drive client retries."""
+    monkeypatch.setattr(gdrive_retry.time, "sleep", lambda _: None)
+    execute = MockListRequest.execute
+    failed = []
+
+    def fail_once(request: MockListRequest) -> dict:
+        if not failed and f"name contains '{name_prefix}'" in request._q:
+            failed.append(request)
+            raise ConnectionResetError("Drive dropped the connection")
+        return execute(request)
+
+    monkeypatch.setattr(MockListRequest, "execute", fail_once)
+
+
+def get_mock_event(path: str = "email@email.com/test.job") -> FileChangeEvent:
+    email = path.split("/")[0]
+    file_path = path.split("/")[-1]
+    content = "Hello, world!"
+    new_hash = get_event_hash_from_content(content)
+    return FileChangeEvent(
+        datasite_email=email,
+        id=uuid.uuid4(),
+        path_in_datasite=file_path,
+        submitted_timestamp=time.time(),
+        timestamp=time.time(),
+        content=content,
+        new_hash=new_hash,
+        event_filepath=FileChangeEventsMessageFileName(
+            id=uuid.uuid4(),
+            file_path_in_datasite=file_path,
+            timestamp=time.time(),
+        ),
+    )
+
+
+def get_mock_events_messages(
+    n_events: int = 2, datasite_email: str = "email@email.com"
+) -> List[FileChangeEventsMessage]:
+    """``n_events`` messages of one event each, under ``datasite_email``.
+
+    A watcher drops an event a peer publishes for another datasite, so pass the
+    publishing peer's email when the messages go through its outbox.
+    """
+    return [
+        FileChangeEventsMessage(
+            events=[get_mock_event(f"{datasite_email}/test{i}.job")]
+        )
+        for i in range(n_events)
+    ]
+
+
+def mock_message(path: str = "email@email.com/test.job") -> ProposedFileChangesMessage:
+    email = path.split("/")[0]
+    return ProposedFileChangesMessage(
+        sender_email=email,
+        proposed_file_changes=[
+            ProposedFileChange(
+                old_hash=None,
+                path_in_datasite=path,
+                content="Hello, world!",
+                datasite_email=email,
+            ),
+        ],
+    )
+
+
+def get_mock_proposed_events_messages(
+    n_events: int = 2, email: str = "email@email.com"
+) -> List[ProposedFileChangesMessage]:
+    return [mock_message(f"{email}/test{i}.job") for i in range(n_events)]
+
+
+def create_tmp_dataset_files():
+    tmp_dir = Path("/tmp/syft-datasets-testing") / str(random.randint(1, 1000000))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    mock_path = tmp_dir / "mock.txt"
+    private_path = tmp_dir / "private.txt"
+    readme_path = tmp_dir / "readme.md"
+    mock_path.write_text("Hello, world!")
+    private_path.write_text("Hello, world private!")
+    readme_path.write_text("Hello, world!")
+    return mock_path, private_path, readme_path
+
+
+def create_tmp_dataset_files_with_parquet():
+    """Create temporary dataset files with parquet files (binary format)."""
+    import pandas as pd
+
+    tmp_dir = Path("/tmp/syft-datasets-testing") / str(random.randint(1, 1000000))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create parquet files (binary format)
+    mock_df = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4, 5],
+            "name": ["Alice", "Bob", "Charlie", "Diana", "Eve"],
+            "age": [25, 30, 35, 28, 32],
+            "score": [85.5, 90.0, 88.5, 92.0, 87.5],
+        }
+    )
+    mock_path = tmp_dir / "mock_data.parquet"
+    mock_df.to_parquet(mock_path, index=False)
+
+    private_df = pd.DataFrame(
+        {
+            "id": [1, 2, 3],
+            "sensitive_data": ["secret1", "secret2", "secret3"],
+            "value": [100, 200, 300],
+        }
+    )
+    private_path = tmp_dir / "private_data.parquet"
+    private_df.to_parquet(private_path, index=False)
+
+    readme_path = tmp_dir / "readme.md"
+    readme_path.write_text(
+        "# Dataset with Parquet Files\n\nThis dataset contains parquet files."
+    )
+
+    return mock_path, private_path, readme_path
+
+
+def create_test_project_folder(
+    with_pyproject: bool = False,
+    multiplier: int = 2,
+    prefix: str = "test_project_",
+) -> Path:
+    """Create a test project folder with helpers package and main.py.
+
+    Creates folder structure:
+        project_dir/
+        ├── pyproject.toml       # only if with_pyproject=True
+        ├── main.py              # entrypoint, imports from helpers.helper
+        └── helpers/
+            ├── __init__.py      # package marker
+            └── helper.py        # contains process_data() and get_multiplier()
+
+    Args:
+        with_pyproject: If True, creates pyproject.toml in the folder
+        multiplier: Value returned by get_multiplier() in helper.py
+        prefix: Prefix for the temp directory name
+
+    Returns:
+        Path to the created project directory
+    """
+    import tempfile
+
+    project_dir = Path(tempfile.mkdtemp(prefix=prefix))
+
+    # Create pyproject.toml if requested
+    if with_pyproject:
+        pyproject_path = project_dir / "pyproject.toml"
+        pyproject_path.write_text("""
+[project]
+name = "test-project"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+""")
+
+    # Create nested helpers package
+    helpers_dir = project_dir / "helpers"
+    helpers_dir.mkdir(parents=True)
+
+    # Create __init__.py to make it a package
+    init_path = helpers_dir / "__init__.py"
+    init_path.write_text("# helpers package\n")
+
+    # Create helper module
+    helper_path = helpers_dir / "helper.py"
+    helper_path.write_text(f'''
+def process_data(data):
+    """Helper function to process data."""
+    return f"Processed: {{data}}"
+
+def get_multiplier():
+    return {multiplier}
+''')
+
+    # Create main.py that imports from nested helpers package
+    main_path = project_dir / "main.py"
+    main_path.write_text("""
+import json
+import syft as sy
+from helpers.helper import process_data, get_multiplier
+
+# Read data from dataset
+data_path = sy.resolve_dataset_file_path("my dataset")
+
+with open(data_path, "r") as data_file:
+    data = data_file.read()
+
+# Use helper functions
+processed = process_data(data)
+multiplier = get_multiplier()
+
+result = {
+    "original": data,
+    "processed": processed,
+    "multiplier": multiplier
+}
+
+with open("outputs/result.json", "w") as f:
+    f.write(json.dumps(result))
+""")
+
+    return project_dir
+
+
+# Domain-free collection used by engine-level tests, in place of the RDS
+# dataset specs (syft must not depend on the product layer).
+TEST_COLLECTION_PREFIX = "syft_testcollection"
+TEST_COLLECTION_SUBPATH = Path("public/test_collections")
+
+
+def grant_job_inbox_access(do_manager, ds_email: str) -> None:
+    """Grant DS write access to the DO's job inbox."""
+    do_manager.datasite_owner_syncer.perm_context.open(
+        f"app_data/job/inbox/{ds_email}/"
+    ).grant_write_access(ds_email)
+
+
+def router_with_mock_connection(email: str) -> ConnectionRouter:
+    """A connection router over a mock Drive, for a part a test builds on its
+    own. In a manager every part shares the router
+    ``SyftboxManager.from_config`` builds."""
+    cached_client, _ = pair_with_mock_service(email, "peer@example.com")
+    return ConnectionRouter(
+        connections=SyftboxManager._drive_connections(cached_client),
+        peer_store=PeerStore(email=email),
+    )

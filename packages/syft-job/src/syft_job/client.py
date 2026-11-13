@@ -1,0 +1,963 @@
+import logging
+import os
+import shutil
+import warnings
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Iterable, List, Optional, Tuple
+
+import yaml
+from syft_migration import MigrationError, ProtocolSchema
+from syft_perms.syftperm_context import SyftPermContext
+
+from .config import SyftJobConfig
+from .read_permissions import (
+    REQUESTED_READ_PERMISSIONS_HEADER,
+    ReadPermissions,
+    normalize_file_names,
+    validate_read_permissions,
+    job_read_permissions_for,
+    validate_read_permissions_as_do,
+)
+from .install_source import get_syft_install_source
+from .job import JobInfo, JobsList
+from .job_ref import RequestRef
+from .request_info import RequestInfo
+from .migrations.registry import FIRST_PROTOCOL_WITH_REQUESTS
+from .job_storage import JobRef, JobStorage
+from .models import JobState, JobStatus, JobSubmissionMetadata, RequestMetadata
+from .api_requests import receive_request
+from .policies import ApiResolver
+from .review_grants import grant_ds_state_read
+from .submission import (
+    RESERVED_CALL_FILES,
+    SUBMISSION_ENTRIES,
+    SUBMISSION_HASH_HEADER,
+    InvalidSubmissionError,
+    OwnerJobRecord,
+    code_hash,
+    has_listed_files,
+    request_hash,
+    lock_for_submitter,
+    submission_hash,
+)
+from .submission import validate_submission as validate_submission_dir
+
+# Python version used when creating virtual environments for job execution
+RUN_SCRIPT_PYTHON_VERSION = "3.12"
+
+# Strict schema: only these entries are allowed in a job submission
+VALID_SUBMISSION_ENTRIES = SUBMISSION_ENTRIES
+
+
+# What reading a config.yaml raises while it is still arriving.
+METADATA_ERRORS = (OSError, ValueError, yaml.YAMLError, MigrationError)
+
+logger = logging.getLogger(__name__)
+
+
+class BaseJobClient(ABC):
+    """Interface for job clients."""
+
+    config: SyftJobConfig
+    current_user_email: str
+
+    @abstractmethod
+    def submit_python_job(
+        self,
+        user: str,
+        code_path: str,
+        job_name: Optional[str] = "",
+        **kwargs,
+    ) -> Path: ...
+
+    @abstractmethod
+    def submit_bash_job(self, user: str, script: str, job_name: str = "") -> Path: ...
+
+    @abstractmethod
+    def setup_ds_job_folder_as_do(self, ds_email: str) -> Path: ...
+
+    @abstractmethod
+    def scan_inbox(self) -> None: ...
+
+    @property
+    @abstractmethod
+    def jobs(self) -> JobsList: ...
+
+
+class JobClient(BaseJobClient):
+    """Client for submitting jobs to SyftBox."""
+
+    def __init__(
+        self,
+        config: SyftJobConfig,
+        target_datasite_owner_email: Optional[str] = None,
+        peer_schema: Optional[Callable[[str], Optional[ProtocolSchema]]] = None,
+    ):
+        """Initialize JobClient with configuration and optional user email for job views."""
+        self.config = config
+        self.current_user_email = (
+            config.current_user_email
+        )  # From SyftBox folder (for "submitted_by")
+        self.target_datasite_owner_email = (
+            target_datasite_owner_email or config.current_user_email
+        )  # The email of the datasite owner of the jobs
+        self.has_do_role = config.has_do_role
+        # Loads the api a request calls: to record its hash at approval, and to
+        # show its policies with the job.
+        self.api_resolver: Optional[ApiResolver] = None
+        self.peer_install_sources: dict[
+            str, str
+        ] = {}  # do_email -> syft install source (local path, git URL, or "syft==X.Y.Z") advertised by that DO in their VersionInfo
+        # All model reads/writes and path resolution go through the manager;
+        # peer_schema (peer email -> job ProtocolSchema) comes from syft.
+        self.manager = JobStorage(config=config, peer_schema=peer_schema)
+
+        # Validate that user_email exists in SyftBox root
+        self._validate_user_email()
+
+    @classmethod
+    def from_config(
+        cls,
+        config: SyftJobConfig,
+        peer_schema: Optional[Callable[[str], Optional[ProtocolSchema]]] = None,
+    ) -> "JobClient":
+        return cls(config, config.current_user_email, peer_schema=peer_schema)
+
+    def _validate_user_email(self) -> None:
+        """Validate that the user_email directory exists in SyftBox root."""
+        user_dir = self.config.get_user_dir(self.target_datasite_owner_email)
+        if not user_dir.exists():
+            # Create user directory if it doesn't exist
+            user_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Created user directory: {user_dir}")
+
+    def _ensure_my_submission_directory_exists(
+        self, target_datasite_owner_email: str
+    ) -> None:
+        """Ensure inbox directory structure exists for submitting jobs."""
+        my_submission_dir = self.config._get_job_submission_dir_for_me(
+            target_datasite_owner_email,
+            protocol_version=self.manager.negotiated_protocol_version_for_peer(
+                target_datasite_owner_email, raise_on_unknown=False
+            ),
+        )
+        my_submission_dir.mkdir(parents=True, exist_ok=True)
+
+    def setup_ds_job_folder_as_do(self, ds_email: str) -> Path:
+        """Create inbox and review subdirectories for a DS with appropriate permissions.
+
+        Called when DO approves a peer — creates the folder structure that allows
+        the DS to submit jobs.
+
+        Args:
+            ds_email: Email of the data scientist to create the folder for.
+
+        Returns:
+            Path to the created DS inbox folder.
+        """
+        datasite = self.config.syftbox_folder / self.current_user_email
+
+        # Create inbox folder for DS with write access
+        ds_inbox_dir = (
+            self.config.get_all_submissions_dir(self.current_user_email) / ds_email
+        )
+        ds_inbox_dir.mkdir(parents=True, exist_ok=True)
+        ctx = SyftPermContext(datasite=datasite)
+        inbox_rel_dir = ds_inbox_dir.relative_to(datasite)
+        ctx.open(inbox_rel_dir).grant_write_access(ds_email)
+        self.setup_ds_request_folder_as_do(ds_email)
+
+        # Create review folder for DS. The DS reads only the named files there
+        # until a release grants more.
+        ds_review_dir = self.config.get_review_dir(self.current_user_email) / ds_email
+        ds_review_dir.mkdir(parents=True, exist_ok=True)
+        grant_ds_state_read(ctx, ds_review_dir, ds_email)
+
+        return ds_inbox_dir
+
+    def setup_ds_request_folder_as_do(self, ds_email: str) -> Path:
+        """Create requests/<ds_email>/ and let the DS write api calls there.
+
+        Safe to call again: a peer approved before requests existed gets the
+        folder when its peers load.
+        """
+        datasite = self.config.syftbox_folder / self.current_user_email
+        ds_requests_dir = (
+            self.config.get_requests_dir(self.current_user_email) / ds_email
+        )
+        ds_requests_dir.mkdir(parents=True, exist_ok=True)
+        ctx = SyftPermContext(datasite=datasite)
+        ctx.open(ds_requests_dir.relative_to(datasite)).grant_write_access(ds_email)
+        return ds_requests_dir
+
+    # ──────────────────────────────────────────────
+    # Submission (DS side)
+    # ──────────────────────────────────────────────
+
+    def submit_bash_job(self, user: str, script: str, job_name: str = "") -> Path:
+        """
+        Submit a bash job for a user.
+
+        Args:
+            user: Email address of the datasite owner to submit job to
+            script: Bash script content to execute
+            job_name: Name of the job (directory name). If empty, auto-generated.
+
+        Returns:
+            Path to the created job directory in inbox/
+
+        Raises:
+            FileExistsError: If job with same name already exists
+        """
+        submitting_to_email = user
+        # Generate default job name if not provided
+        if not job_name.strip():
+            from uuid import uuid4
+
+            random_id = str(uuid4())[0:8]
+            job_name = f"Job - {random_id}"
+        JobStorage.validate_job_name(job_name)
+
+        ref, job_dir = self._new_submission_dir(submitting_to_email, job_name)
+        self._write_bash_script(job_dir, script)
+
+        # Write config.yaml in the version the datasite owner understands
+        config = JobSubmissionMetadata(
+            name=job_name,
+            type="bash",
+            submitted_by=self.current_user_email,
+            datasite_email=submitting_to_email,
+            submitted_at=datetime.now(timezone.utc),
+            files=["script.sh"],
+            headers={SUBMISSION_HASH_HEADER: code_hash(job_dir)},
+        )
+        self.manager.write_submission(ref, config)
+
+        return job_dir
+
+    def _new_submission_dir(
+        self, submitting_to_email: str, job_name: str
+    ) -> tuple[JobRef, Path]:
+        """Resolve inbox/<ds_email>/[v<n>/]<job_name>/ for a new job.
+
+        Creates the parent folders, not the job dir itself.
+        """
+        user_dir = self.config.get_user_dir(submitting_to_email)
+        if not user_dir.exists():
+            user_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Created user directory: {user_dir}")
+        self._ensure_my_submission_directory_exists(submitting_to_email)
+
+        ref = self.manager.new_submission_ref(submitting_to_email, job_name)
+        job_dir = self.manager.submission_dir(ref)
+        if job_dir.exists():
+            raise FileExistsError(
+                f"Job '{job_name}' already exists for user '{submitting_to_email}'"
+            )
+        return ref, job_dir
+
+    def submit_api_request(
+        self,
+        user: str,
+        job_name: str,
+        api_name: str,
+        files: dict[str, bytes],
+    ) -> Path:
+        """Call an api of ``user``: write a request to their requests/ folder.
+
+        The request holds the files the call sends, e.g. "code/params.json".
+        The data owner accepts only the files the api takes by name, and adds
+        the api's code to make the job.
+
+        Args:
+            user: Email address of the datasite owner
+            job_name: Name of the job the call becomes
+            api_name: The api to call
+            files: {path relative to the job's root: content}
+
+        Returns:
+            Path to the created request directory
+        """
+        JobStorage.validate_job_name(job_name)
+        reserved = sorted(RESERVED_CALL_FILES & set(files))
+        if reserved:
+            raise ValueError(f"A call can't send {reserved}; they are written for it")
+        ref = self.manager.new_request_ref(user, job_name)
+        if int(ref.protocol_version) < int(FIRST_PROTOCOL_WITH_REQUESTS):
+            raise ValueError(
+                f"{user} runs a syft-job release without api calls (job protocol "
+                f"{ref.protocol_version}). Ask them to upgrade."
+            )
+        request_dir = self.manager.request_dir(ref)
+        # The call becomes a job of the same name in inbox/.
+        job_dir = self.manager.submission_dir(ref.job_ref)
+        if request_dir.exists() or job_dir.exists():
+            raise FileExistsError(f"Job '{job_name}' already exists for '{user}'")
+        request_dir.mkdir(parents=True)
+        for rel_path, content in files.items():
+            dest = request_dir / rel_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(content)
+        request = RequestMetadata(
+            api=api_name,
+            submitted_at=datetime.now(timezone.utc),
+            files=sorted(files),
+            files_hash=request_hash(request_dir),
+        )
+        self.manager.write_request(ref, request)
+        return request_dir
+
+    def _write_bash_script(self, job_dir: Path, script: str) -> None:
+        job_dir.mkdir(parents=True)
+        # Create code/ directory with the script
+        code_dir = job_dir / "code"
+        code_dir.mkdir()
+        (code_dir / "script.sh").write_text(script)
+
+        # Create run.sh at job root
+        run_script_path = job_dir / "run.sh"
+        run_script_path.write_text(script)
+        os.chmod(run_script_path, 0o755)
+
+    def _detect_entrypoint(self, folder_path: Path) -> Optional[str]:
+        """Auto-detect entrypoint for folder submissions.
+
+        Detection priority:
+        1. main.py - most common convention
+        2. Single .py file at root - if only one exists
+
+        Args:
+            folder_path: Path to the folder to search
+
+        Returns:
+            Detected entrypoint filename or None if not found
+        """
+        # Check main.py first (most common convention)
+        if (folder_path / "main.py").exists():
+            return "main.py"
+
+        # Check for single .py file at root
+        py_files = [
+            f for f in folder_path.iterdir() if f.is_file() and f.suffix == ".py"
+        ]
+        if len(py_files) == 1:
+            return py_files[0].name
+
+        return None
+
+    def _validate_code_path_and_entrypoint(
+        self, code_path: str, entrypoint: Optional[str]
+    ) -> Tuple[Path, bool, str]:
+        """
+        Validate code path and entrypoint for Python job submission.
+
+        Args:
+            code_path: Path to Python file or folder
+            entrypoint: Entry point file name (auto-detected if not provided)
+
+        Returns:
+            Tuple of (resolved_code_path, is_folder_submission, validated_entrypoint)
+
+        Raises:
+            FileNotFoundError: If code_path doesn't exist
+            ValueError: If validation fails
+        """
+        code_path_input = code_path  # Keep original for error messages
+        resolved_path = Path(code_path).expanduser().resolve()
+
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Code path does not exist: {code_path_input}")
+
+        is_folder_submission = resolved_path.is_dir()
+
+        if is_folder_submission:
+            if not entrypoint:
+                # Auto-detect entrypoint
+                entrypoint = self._detect_entrypoint(resolved_path)
+                if not entrypoint:
+                    raise ValueError(
+                        "Could not auto-detect entrypoint. No main.py or single .py file "
+                        "found at folder root. Please specify the entrypoint explicitly."
+                    )
+
+            entrypoint_path = resolved_path / entrypoint
+            if not entrypoint_path.exists() or not entrypoint_path.is_file():
+                raise ValueError(
+                    f"Entrypoint file '{entrypoint}' not found in folder: {code_path_input}"
+                )
+
+            if entrypoint_path.suffix != ".py":
+                raise ValueError(
+                    f"Entrypoint file must be a Python file (.py): {entrypoint}"
+                )
+        else:
+            if resolved_path.suffix != ".py":
+                raise ValueError(
+                    f"Code path must be a Python file (.py): {code_path_input}"
+                )
+            # Auto-detect entrypoint for file submissions
+            entrypoint = resolved_path.name
+
+        return resolved_path, is_folder_submission, entrypoint
+
+    def _resolve_install_source_for(self, do_email: str) -> str:
+        """Return the syft install source to bake into a job's run.sh.
+
+        Prefers the source advertised by the DO during peer-version exchange
+        (stored on `self.peer_install_sources`). Falls back to local detection
+        with a loud warning if the DO never advertised one (e.g. older client).
+        """
+        advertised = self.peer_install_sources.get(do_email)
+        if advertised:
+            return advertised
+
+        fallback = get_syft_install_source()
+        warnings.warn(
+            f"\n{'=' * 78}\n"
+            f"WARNING: No syft install source advertised by DO {do_email!r}.\n"
+            f"Falling back to local detection on the DS side: {fallback!r}.\n"
+            f"The DO may be running an older syft; the job may fail to\n"
+            f"install dependencies on the DO's machine.\n"
+            f"{'=' * 78}",
+            stacklevel=3,
+        )
+        return fallback
+
+    def _generate_python_run_script(
+        self,
+        entrypoint_path: str,
+        dependencies: List[str],
+        has_pyproject: bool,
+        install_source: str,
+    ) -> str:
+        """
+        Generate bash script for Python job execution.
+
+        Args:
+            entrypoint_path: Filename to execute (e.g., "main.py" or "script.py")
+            dependencies: List of dependencies to install
+            has_pyproject: Whether the code has a pyproject.toml
+            install_source: syft install source to use (pip/uv-compatible string).
+
+        Returns:
+            Bash script content
+        """
+        all_dependencies = [install_source] + dependencies
+
+        if has_pyproject:
+            # For projects with pyproject.toml, run uv sync inside the code folder
+            # entrypoint_path is like "code/main.py", code_folder is "code"
+            code_folder = "code"
+            # Always install syft (and any extra dependencies) after uv sync
+            deps_str = " ".join(f'"{dep}"' for dep in all_dependencies)
+            install_deps_cmd = f"uv pip install {deps_str}"
+
+            return f"""#!/bin/bash
+set -euo pipefail
+export UV_SYSTEM_PYTHON=false
+cd {code_folder}
+uv venv --python {RUN_SCRIPT_PYTHON_VERSION}
+source .venv/bin/activate
+uv sync --python {RUN_SCRIPT_PYTHON_VERSION}
+{install_deps_cmd}
+export PYTHONPATH=.:${{PYTHONPATH:-}}
+python {entrypoint_path}
+"""
+        else:
+            # entrypoint_path is just the filename (e.g. "main.py")
+            # We cd into code/ and run from there so relative paths (like params.json) work
+            code_folder = "code"
+
+            deps_str = " ".join(f'"{dep}"' for dep in all_dependencies)
+            return f"""#!/bin/bash
+set -euo pipefail
+export UV_SYSTEM_PYTHON=false
+cd {code_folder}
+uv venv --python {RUN_SCRIPT_PYTHON_VERSION}
+source .venv/bin/activate
+uv pip install {deps_str}
+export PYTHONPATH=.:${{PYTHONPATH:-}}
+python {entrypoint_path}
+"""
+
+    def submit_python_job(
+        self,
+        user: str,
+        code_path: str,
+        job_name: Optional[str] = "",
+        dependencies: Optional[List[str]] = None,
+        entrypoint: Optional[str] = None,
+        share_logs_with_submitter: bool = False,
+        share_outputs_with_submitter: Optional[bool] = None,
+        share_files: Optional[ReadPermissions] = None,
+    ) -> Path:
+        """
+        Submit a Python job for a user (supports both files and folders).
+
+        Args:
+            user: Email address of the datasite owner to submit job to
+            code_path: Path to Python file or folder containing Python code
+            job_name: Name of the job (directory name). If empty, auto-generated.
+            dependencies: List of Python packages to install
+            entrypoint: Entry point file name (auto-detected if not provided)
+            share_logs_with_submitter: Ask the data owner to let you read
+                stdout and stderr.
+            share_outputs_with_submitter: Ask the data owner to let you read
+                the outputs. None (default) means True unless share_files is given.
+            share_files: Instead of the two flags, who should read which run
+                file, as {file: [emails]}, e.g. {"stdout.txt": [me]}. The data
+                owner approves none, some, or all of the request.
+
+        Returns:
+            Path to the created job directory in inbox/
+
+        Raises:
+            FileExistsError: If job with same name already exists
+            ValueError: If code_path validation fails, or share_files comes
+                with a share flag
+            FileNotFoundError: If code_path doesn't exist
+            TypeError: If share_files is not {file: [emails]}
+        """
+        if share_outputs_with_submitter is None:
+            share_outputs_with_submitter = share_files is None
+        self._check_share_args(
+            share_logs_with_submitter, share_outputs_with_submitter, share_files
+        )
+        requested_read_permissions = self._requested_read_permissions(
+            share_logs_with_submitter, share_outputs_with_submitter, share_files
+        )
+        submitting_to_email = user
+        # Generate default job name if not provided
+        if not job_name:
+            from uuid import uuid4
+
+            random_id = str(uuid4())[0:8]
+            job_name = f"Job - {random_id}"
+        JobStorage.validate_job_name(job_name)
+
+        # Validate code path and entrypoint
+        code_path_resolved, is_folder_submission, entrypoint = (
+            self._validate_code_path_and_entrypoint(code_path, entrypoint)
+        )
+
+        ref, job_dir = self._new_submission_dir(submitting_to_email, job_name)
+        job_dir.mkdir(parents=True)
+
+        # Copy code into code/ subdirectory
+        code_dest = job_dir / "code"
+        if is_folder_submission:
+            shutil.copytree(code_path_resolved, code_dest)
+            # Entrypoint path is relative to code/
+            pyproject_path = code_dest / "pyproject.toml"
+        else:
+            code_dest.mkdir(parents=True)
+            shutil.copy2(code_path_resolved, code_dest / code_path_resolved.name)
+            pyproject_path = None
+
+        # Resolve install source: prefer what the DO advertised in their VersionInfo,
+        # fall back to local detection with a warning if the DO didn't advertise one.
+        install_source = self._resolve_install_source_for(submitting_to_email)
+
+        # Generate bash script for Python execution
+        dependencies = dependencies or []
+        has_pyproject = pyproject_path is not None and pyproject_path.exists()
+        bash_script = self._generate_python_run_script(
+            entrypoint, dependencies, has_pyproject, install_source
+        )
+
+        # Create run.sh file
+        run_script_path = job_dir / "run.sh"
+        run_script_path.write_text(bash_script)
+        os.chmod(run_script_path, 0o755)
+
+        # Build file manifest of code/ contents
+        files = [
+            str(p.relative_to(code_dest)) for p in code_dest.rglob("*") if p.is_file()
+        ]
+
+        # Compute all_dependencies for config
+        all_dependencies = [install_source] + dependencies
+
+        # Write config.yaml in the version the datasite owner understands
+        config = JobSubmissionMetadata(
+            name=job_name,
+            type="python",
+            submitted_by=self.current_user_email,
+            datasite_email=submitting_to_email,
+            submitted_at=datetime.now(timezone.utc),
+            entrypoint=entrypoint,
+            dependencies=all_dependencies,
+            files=files,
+            is_folder_submission=is_folder_submission,
+            code_path=str(code_path_resolved),
+            headers={
+                REQUESTED_READ_PERMISSIONS_HEADER: requested_read_permissions,
+                SUBMISSION_HASH_HEADER: code_hash(job_dir),
+            },
+        )
+        self.manager.write_submission(ref, config)
+
+        return job_dir
+
+    # ──────────────────────────────────────────────
+    # Validation and reception (DO side)
+    # ──────────────────────────────────────────────
+
+    def validate_submission(self, inbox_job_path: Path) -> tuple[bool, str]:
+        """Check strict schema: only code/ + run.sh + config.yaml, no symlinks.
+
+        Returns:
+            Tuple of (is_valid, reason_if_invalid)
+        """
+        return validate_submission_dir(inbox_job_path)
+
+    def receive_job(
+        self,
+        ds_email: str,
+        job_name: str,
+        protocol_version: str,
+    ) -> Optional[JobState]:
+        """Receive a job once all its files arrived, and create its state in review/.
+
+        Called by scan_inbox() for a job with no state yet. Sync delivers a job
+        in any number of batches, so a job counts as received only when its
+        files hash to the value the submitter declared. The owner then records
+        the hash of what it received, makes the job's inbox folder read-only
+        for the submitter, and marks the job pending. The state is written in
+        the layout/version of the protocol the job was submitted with.
+
+        Args:
+            ds_email: Email of the data scientist who submitted the job.
+            job_name: Name of the job.
+            protocol_version: Protocol layout the job was submitted with.
+
+        Returns:
+            The created JobState, or None while files are still arriving or
+            when another process received the job first.
+        """
+        ref = JobRef(self.current_user_email, ds_email, job_name, protocol_version)
+        # A record without a state means an earlier receipt stopped half-way;
+        # it is finished below, with the hash it recorded.
+        record = self.manager.read_owner_record(ref)
+        if record is None:
+            try:
+                record = self._claim_receipt(ref)
+            except InvalidSubmissionError as e:
+                state = self._rejected_state(datetime.now(timezone.utc), str(e))
+                self.manager.write_state(ref, state)
+                return state
+            if record is None:
+                return None
+
+        self._lock_submission(ref)
+        state = JobState(
+            status=JobStatus.PENDING,
+            received_at=record.received_at,
+            requested_read_permissions=self._request_from_submission(ref),
+        )
+        self.manager.write_state(ref, state)
+        return state
+
+    @staticmethod
+    def _check_share_args(
+        share_logs_with_submitter: bool,
+        share_outputs_with_submitter: bool,
+        share_files: object,
+    ) -> None:
+        """Refuse share_files with a flag, or a share_files that isn't {file: [emails]}."""
+        if share_files is not None and (
+            share_logs_with_submitter or share_outputs_with_submitter
+        ):
+            raise ValueError("Give share_files or the share flags, not both.")
+        validate_read_permissions(normalize_file_names(share_files))
+
+    def _requested_read_permissions(
+        self,
+        share_logs_with_submitter: bool,
+        share_outputs_with_submitter: bool,
+        share_files: object,
+    ) -> ReadPermissions:
+        """The read permissions a submission asks for: share_files, or the flags.
+
+        The file names in share_files are made plain, e.g. "./stderr.txt" -> "stderr.txt".
+        """
+        if share_files is not None:
+            return validate_read_permissions(normalize_file_names(share_files))
+        return job_read_permissions_for(
+            [self.current_user_email],
+            share_logs_with_submitter,
+            share_outputs_with_submitter,
+        )
+
+    def _request_from_submission(self, ref: JobRef) -> ReadPermissions:
+        """The valid part of the submitter's request. Nothing it wrote is approved."""
+        headers = self.manager.read_submission(ref).headers
+        requested_read_permissions = headers.get(REQUESTED_READ_PERMISSIONS_HEADER)
+        return validate_read_permissions_as_do(requested_read_permissions)
+
+    def _claim_receipt(self, ref: JobRef) -> Optional[OwnerJobRecord]:
+        """Record the received hash once every file arrived, and return the record.
+
+        Returns None while files are still arriving, or when another process
+        claimed the receipt first.
+
+        Raises:
+            InvalidSubmissionError: every file arrived, but the submission is
+                outside the schema or holds a symlink.
+        """
+        if not self._job_has_all_files(ref):
+            return None
+        submission_dir = self.manager.submission_dir(ref)
+        valid, reason = self.validate_submission(submission_dir)
+        if not valid:
+            raise InvalidSubmissionError(reason)
+        record = OwnerJobRecord(
+            received_hash=submission_hash(submission_dir),
+            received_at=datetime.now(timezone.utc),
+        )
+        return record if self.manager.claim_owner_record(ref, record) else None
+
+    def _job_has_all_files(self, ref: JobRef) -> bool:
+        """Whether every file of the job arrived.
+
+        The submitter declares the hash of run.sh and code/ in config.yaml. A
+        submitter from before that header is checked against the file manifest.
+        """
+        try:
+            metadata = self.manager.read_submission(ref)
+        except METADATA_ERRORS:
+            return False  # config.yaml is still arriving
+        submission_dir = self.manager.submission_dir(ref)
+        declared = metadata.headers.get(SUBMISSION_HASH_HEADER)
+        if declared:
+            return code_hash(submission_dir) == declared
+        return has_listed_files(submission_dir, metadata.files)
+
+    def _request_has_all_files(self, ref: RequestRef) -> bool:
+        """Whether every file of the request arrived.
+
+        The caller declares the hash of every file but request.yaml in it.
+        """
+        try:
+            request = self.manager.read_request(ref)
+        except METADATA_ERRORS:
+            return False  # request.yaml is still arriving
+        return request_hash(self.manager.request_dir(ref)) == request.files_hash
+
+    def _lock_submission(self, ref: JobRef) -> None:
+        """Make the job's inbox folder read-only for its submitter.
+
+        The permission file in the job folder is the nearest one for every
+        file below it, so it replaces the submitter's write on inbox/<ds>/ for
+        this job only. The job name is never part of a pattern, so a name with
+        glob characters cannot escape the lock.
+        """
+        lock_for_submitter(self.manager.submission_dir(ref), ref.ds_email)
+
+    def _rejected_state(self, now: datetime, reason: str) -> JobState:
+        return JobState(
+            status=JobStatus.REJECTED,
+            received_at=now,
+            rejected_by=self.current_user_email,
+            rejected_at=now,
+            review_reason=reason,
+        )
+
+    def scan_inbox(self) -> None:
+        """Scan inbox/ and requests/ for new submissions and receive them.
+
+        For each job in inbox/ (any protocol layout) that doesn't have a
+        corresponding state.yaml in review/, receives it once all its files
+        arrived. A pending job received before submission hashes existed gets
+        its record here, once. A request (an api call) becomes an approved job
+        in inbox/, or is rejected.
+        """
+        for ref in self.manager.iter_submission_refs(self.current_user_email):
+            if (self.manager.review_dir(ref) / "state.yaml").exists():
+                self._record_received_hash(ref)
+            else:
+                self.receive_job(ref.ds_email, ref.job_name, ref.protocol_version)
+        for request_ref in self.manager.iter_request_refs(self.current_user_email):
+            receive_request(self, request_ref)
+
+    def _record_received_hash(self, ref: JobRef) -> None:
+        """Record the received hash of a pending job that has no record yet.
+
+        Such a job was received before submission hashes existed, or was sent
+        back to pending because it was approved before them. It gets the lock
+        a new job gets at receipt, once: only the process that creates the
+        record writes it.
+        """
+        if self.manager.owner_record_path(ref).exists():
+            return
+        state = self.manager.read_state(ref)
+        if state.status != JobStatus.PENDING:
+            return
+        record = OwnerJobRecord(
+            received_hash=submission_hash(self.manager.submission_dir(ref)),
+            received_at=state.received_at or datetime.now(timezone.utc),
+        )
+        if self.manager.claim_owner_record(ref, record):
+            self._lock_submission(ref)
+
+    # ──────────────────────────────────────────────
+    # Listing
+    # ──────────────────────────────────────────────
+
+    def _get_all_jobs(self) -> List[JobInfo]:
+        """Get all jobs by scanning inbox/ and correlating with review/.
+
+        Jobs from any protocol layout are upgraded in memory to the current
+        object versions.
+        """
+        jobs: list[JobInfo] = []
+        syftbox_root = self.config.syftbox_folder
+
+        if not syftbox_root.exists():
+            return jobs
+
+        # Scan through all user directories in SyftBox root (peers)
+        for datasite_owner_dir in syftbox_root.iterdir():
+            if not datasite_owner_dir.is_dir():
+                continue
+
+            email = datasite_owner_dir.name
+            jobs += _readable(self.manager.iter_submission_refs(email), self._job_info)
+
+        return jobs
+
+    def _job_info(self, ref: JobRef) -> JobInfo:
+        return JobInfo(
+            job_metadata=self.manager.read_submission(ref),
+            state=self._state_or_received(ref),
+            current_user_email=self.current_user_email,
+            client=self,
+            ref=ref,
+        )
+
+    @property
+    def requests(self) -> List[RequestInfo]:
+        """Api calls that haven't become jobs: received, or rejected.
+
+        The DO removes a request once it becomes a job, which is then in
+        .jobs. Scans the inbox first, as .jobs does.
+        """
+        self.scan_inbox()
+        syftbox_root = self.config.syftbox_folder
+        if not syftbox_root.exists():
+            return []
+        requests: list[RequestInfo] = []
+        for datasite_owner_dir in (d for d in syftbox_root.iterdir() if d.is_dir()):
+            refs = self.manager.iter_request_refs(datasite_owner_dir.name)
+            requests += _readable(refs, self._request_info)
+        return requests
+
+    def _request_info(self, ref: RequestRef) -> RequestInfo:
+        return RequestInfo(ref, self.manager.read_request(ref), self)
+
+    def _state_or_received(self, ref: JobRef) -> JobState:
+        try:
+            return self.manager.read_state(ref)
+        except FileNotFoundError:
+            return JobState(status=JobStatus.RECEIVED)
+
+    @property
+    def jobs(self) -> JobsList:
+        """
+        Get all jobs from all peer directories as an indexable list grouped by user.
+
+        Order is the same as the jobs table: jobs on your own datasite first,
+        then the other datasites alphabetically, newest-first within each one.
+        ``jobs[N]`` is the row labelled ``[N]``. Prefer an email and a name
+        (``jobs["do@org.com"]["analysis"]``); both parts stay the same as jobs
+        are added, and the email is what makes the name resolve to one job.
+
+        Returns a JobsList object that can be:
+        - Indexed by email, then name (preferred): jobs["do@org.com"]["analysis"]
+        - Indexed by datasite and submitter, for a name they share:
+          jobs["do@org.com"]["ds@org.com"]["analysis"]
+        - Indexed by name across every datasite: jobs["analysis"]
+        - Indexed by position: jobs[0], jobs[1] — matches the table Index column
+        - Iterated: for job in jobs
+        - Displayed: print(jobs) shows separate tables for each user
+        - HTML display: in Jupyter, shows separate tables for each user with jobs
+
+        Returns:
+            JobsList containing all jobs from all peer directories, grouped by user
+        """
+        # Auto-scan current user's inbox for new submissions before listing
+        self.scan_inbox()
+
+        current_jobs = self._get_all_jobs()
+
+        def job_sort_key(job):
+            # Root owner first, then peers, newest-first within each owner.
+            # This list is the authority for both jobs[N] and the table's [N].
+            try:
+                if job.submitted_at:
+                    ts = datetime.fromisoformat(job.submitted_at.replace("Z", "+00:00"))
+                    time_priority = -ts.timestamp()
+                else:
+                    time_priority = float("inf")
+            except Exception:
+                time_priority = float("inf")
+
+            user_priority = (
+                0 if job.datasite_owner_email == self.current_user_email else 1
+            )
+            status_order = {
+                "received": 0,
+                "pending": 1,
+                "approved": 2,
+                "running": 3,
+                "rejected": 4,
+                "done": 5,
+                "failed": 6,
+            }
+            status_priority = status_order.get(job.status, 7)
+
+            return (
+                user_priority,
+                job.datasite_owner_email,
+                time_priority,
+                status_priority,
+                job.name.lower(),
+            )
+
+        sorted_jobs = sorted(current_jobs, key=job_sort_key)
+        return JobsList(
+            sorted_jobs,
+            self.target_datasite_owner_email,
+            has_do_role=self.has_do_role,
+        )
+
+
+def get_client(
+    syftbox_folder_path: str, email: str, user_email: Optional[str] = None
+) -> JobClient:
+    """
+    Factory function to create a JobClient from SyftBox folder.
+
+    Args:
+        syftbox_folder_path: Path to the SyftBox folder
+        email: Root user email address (explicit, no inference from folder name)
+        user_email: Optional target user email for job views (defaults to root email)
+
+    Returns:
+        Configured JobClient instance
+    """
+    config = SyftJobConfig.from_syftbox_folder(syftbox_folder_path, email)
+    return JobClient(config, user_email)
+
+
+def _readable(refs: Iterable, make_info: Callable) -> list:
+    """make_info(ref) for every ref; one that can't be read is reported."""
+    infos = []
+    for ref in refs:
+        try:
+            infos.append(make_info(ref))
+        except Exception as e:
+            print(f"Error listing job {ref.job_name} from {ref.datasite_email}: {e}")
+    return infos

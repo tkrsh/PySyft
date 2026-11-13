@@ -1,0 +1,1413 @@
+"""The Remote Data Science client."""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional
+from uuid import uuid4
+
+import yaml
+from pydantic import BaseModel, ConfigDict
+from syft_migration import ProtocolSchema
+
+from syft.sync.connections.protocols import Connections
+from syft.sync.syftbox_manager import SyftboxManager
+from syft.sync.peers.peer import Peer
+from syft.sync.utils.waiting import DEFAULT_POLL_INTERVAL, DEFAULT_WAIT_TIMEOUT
+from syft_datasets.dataset_manager import (
+    DATASET_COLLECTION_PREFIX,
+    PRIVATE_DATASET_COLLECTION_PREFIX,
+)
+from syft.sync.utils.pre_submit_scan import run_pre_submit_check
+from syft.sync.version.peer_manager import CompatAction
+from syft_job.client import JobClient
+from syft_job.job import JobInfo
+from syft_job.job_runner import SyftJobRunner
+from syft_job.read_permissions import ReadPermissions
+from syft_datasets.dataset_manager import SHARE_WITH_ANY, SyftDatasetManager
+from syft_datasets.dataset_ref import DatasetNotFoundError
+from syft_datasets.migrations.registry import DATASET_PROTOCOL_VERSION
+from syft_rds.waiting import JobCheck, JobStatusArg, wait_for_dataset, wait_for_job
+from syft_rds.apis import Api, ApiCollection
+from syft_rds.apis.models import APIS_DIR
+from syft_rds.apis.policies import ApiResolver
+from syft_rds.config import (
+    DATASET_COLLECTION_SPECS,
+    MOCK_DATASET_SPEC,
+    PRIVATE_DATASET_SPEC,
+    SyftRDSClientConfig,
+    dataset_variant,
+)
+
+logger = logging.getLogger(__name__)
+
+_ALREADY_PUBLISHED = f"already published at protocol {DATASET_PROTOCOL_VERSION}"
+
+FINISHED_JOB_STATUSES = frozenset({"done", "failed", "rejected"})
+
+
+class DatasetUpgrade(BaseModel):
+    """What ``upgrade()`` did, or would do, for one dataset."""
+
+    tag: str
+    published_before: list[str]
+    published_after: list[str]
+    upload_bytes: int = 0
+    skipped_reason: str | None = None
+    error: str | None = None
+
+    @property
+    def promoted(self) -> bool:
+        return self.skipped_reason is None and self.error is None
+
+    def __str__(self) -> str:
+        if self.error is not None:
+            return f"{self.tag}: failed ({self.error})"
+        if self.skipped_reason is not None:
+            return f"{self.tag}: skipped ({self.skipped_reason})"
+        before = ",".join(self.published_before) or "none"
+        after = ",".join(self.published_after) or "none"
+        return f"{self.tag}: {before} -> {after} ({self.upload_bytes} bytes)"
+
+
+class UpgradeReport(BaseModel):
+    """The result of one ``upgrade()`` sweep."""
+
+    dry_run: bool
+    datasets: list[DatasetUpgrade] = []
+
+    @property
+    def promoted(self) -> list[DatasetUpgrade]:
+        return [d for d in self.datasets if d.promoted]
+
+    @property
+    def failed(self) -> list[DatasetUpgrade]:
+        return [d for d in self.datasets if d.error is not None]
+
+    @property
+    def upload_bytes(self) -> int:
+        return sum(d.upload_bytes for d in self.datasets)
+
+    def __str__(self) -> str:
+        head = "upgrade (dry run)" if self.dry_run else "upgrade"
+        lines = [
+            f"{head}: {len(self.promoted)} promoted, {len(self.failed)} failed, "
+            f"{self.upload_bytes} bytes"
+        ]
+        lines += [f"  {d}" for d in self.datasets]
+        return "\n".join(lines)
+
+    def _repr_html_(self) -> str:
+        rows = "".join(f"<tr><td>{d}</td></tr>" for d in self.datasets)
+        return f"<b>{self}</b><table>{rows}</table>" if rows else f"<b>{self}</b>"
+
+
+def _print_skipped_jobs(skipped: list[tuple[str, str, str]]) -> None:
+    """Report the approved jobs that did not run, and why."""
+    print(f"\n⏭️  {len(skipped)} approved job(s) did not run:")
+    for job_name, peer_email, reason in skipped:
+        print(f"   • {job_name} (submitted by {peer_email}): {reason}")
+    print("   Pass ignore_peer_version=True to run them anyway.")
+
+
+def _peer_schema_lookup(
+    manager: SyftboxManager, protocol_name: str
+) -> Callable[[str], Optional[ProtocolSchema]]:
+    """Look up the ``protocol_name`` schema a peer advertises, on each call."""
+    peer_store = manager.peer_manager.peer_store
+    return lambda email: peer_store.protocol_schema(email, protocol_name)
+
+
+class SyftRDSClient(BaseModel):
+    # Holds live service objects (sync engine + RDS-owned managers), not
+    # serializable data, so arbitrary types are allowed.
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # The nested generic sync engine (composition).
+    sync_engine: SyftboxManager
+    # RDS-owned domain managers, exposed so consumers (e.g. syft-enclave, which
+    # wraps the job client) can read/replace them.
+    job_client: JobClient
+    job_runner: SyftJobRunner | None = None
+    dataset_manager: SyftDatasetManager
+
+    def model_post_init(self, __context: Any) -> None:
+        # A request (an api call) runs with its api's code and policies.
+        if self.job_runner is not None:
+            resolver = ApiResolver(Path(self.syftbox_folder) / self.email / APIS_DIR)
+            self.job_runner.api_resolver = self.job_runner.api_resolver or resolver
+            self.job_client.api_resolver = resolver
+        # React to sync-engine peer lifecycle events with RDS-owned logic.
+        self.sync_engine.on("peer_approved", self._on_peer_approved)
+        self.sync_engine.on("peers_loaded", self._on_peers_loaded)
+        # React to collection restores so RDS can run dataset-specific post-processing
+        # (the private dataset's data_dir fixup) without the sync core knowing datasets.
+        if self.sync_engine.datasite_owner_syncer is not None:
+            self.sync_engine.datasite_owner_syncer.on(
+                "collection_restored", self._on_collection_restored
+            )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: "SyftRDSClientConfig",
+        connections: Connections | None = None,
+    ) -> "SyftRDSClient":
+        """``connections`` replace the ones ``config.sync`` describes; tests
+        pass them over a mock Drive (see ``SyftboxManager.from_config``)."""
+        sync_engine = SyftboxManager.from_config(config.sync, connections)
+        # The job client selects a job protocol version per peer from the
+        # schema the peer advertises, as the dataset manager does for layouts.
+        job_client = JobClient.from_config(
+            config.job,
+            peer_schema=_peer_schema_lookup(sync_engine, "syft-job"),
+        )
+        job_runner = (
+            SyftJobRunner.from_config(config.job) if config.sync.has_do_role else None
+        )
+        # The dataset manager looks up peer schemas as the job client does. It
+        # selects a layout for each peer, and the transport carries one
+        # collection for each layout.
+        dataset_manager = SyftDatasetManager.from_config(
+            config.dataset,
+            peer_schema=_peer_schema_lookup(sync_engine, "syft-dataset"),
+        )
+        return cls(
+            sync_engine=sync_engine,
+            job_client=job_client,
+            job_runner=job_runner,
+            dataset_manager=dataset_manager,
+        )
+
+    @classmethod
+    def _build_rds_pair_from_managers(
+        cls, ds_mgr: SyftboxManager, do_mgr: SyftboxManager
+    ) -> tuple["SyftRDSClient", "SyftRDSClient"]:
+        """Wrap a paired ``(ds, do)`` ``SyftboxManager`` tuple into RDS clients.
+
+        Peers were already approved/loaded during pairing (before our callbacks
+        were registered), so we replay the DO-side setup so its owned
+        ``JobClient`` has the DS job folders + install sources.
+        """
+
+        def _build(mgr: SyftboxManager) -> "SyftRDSClient":
+            assert mgr.config is not None, "paired managers are built from a config"
+            # Compose via the config so the sub-configs are derived (and
+            # alignment-checked) exactly as they are on the from_config path.
+            config = SyftRDSClientConfig._compose(mgr.config)
+            return cls(
+                sync_engine=mgr,
+                job_client=JobClient.from_config(
+                    config.job,
+                    peer_schema=_peer_schema_lookup(mgr, "syft-job"),
+                ),
+                job_runner=(
+                    SyftJobRunner.from_config(config.job) if mgr.has_do_role else None
+                ),
+                dataset_manager=SyftDatasetManager.from_config(
+                    config.dataset,
+                    peer_schema=_peer_schema_lookup(mgr, "syft-dataset"),
+                ),
+            )
+
+        ds_rds = _build(ds_mgr)
+        do_rds = _build(do_mgr)
+        do_rds._on_peers_loaded()
+        for peer in do_mgr.peer_manager.approved_peers:
+            do_rds._on_peer_approved(peer.email)
+        ds_rds._on_peers_loaded()
+        return ds_rds, do_rds
+
+    @classmethod
+    def pair_with_mock_drive_service_connection(
+        cls, **kwargs: Any
+    ) -> tuple["SyftRDSClient", "SyftRDSClient"]:
+        """(ds, do) pair of self-contained RDS clients sharing one mock Drive."""
+        ds_mgr, do_mgr = SyftboxManager.pair_with_mock_drive_service_connection(
+            collection_specs=DATASET_COLLECTION_SPECS, **kwargs
+        )
+        return cls._build_rds_pair_from_managers(ds_mgr, do_mgr)
+
+    @classmethod
+    def pair_with_mock_drive_and_mock_webrtc_connection(
+        cls, **kwargs: Any
+    ) -> tuple["SyftRDSClient", "SyftRDSClient"]:
+        """(ds, do) pair like ``pair_with_mock_drive_service_connection``, with
+        messages over WebRTC joined by a fake channel."""
+        ds_mgr, do_mgr = SyftboxManager.pair_with_mock_drive_and_mock_webrtc_connection(
+            collection_specs=DATASET_COLLECTION_SPECS, **kwargs
+        )
+        return cls._build_rds_pair_from_managers(ds_mgr, do_mgr)
+
+    @classmethod
+    def pair_with_mock_drive_and_local_webrtc_connection(
+        cls, **kwargs: Any
+    ) -> tuple["SyftRDSClient", "SyftRDSClient"]:
+        """(ds, do) pair like ``pair_with_mock_drive_service_connection``, with
+        messages over real WebRTC on this machine. Needs the ``webrtc`` extra."""
+        ds_mgr, do_mgr = (
+            SyftboxManager.pair_with_mock_drive_and_local_webrtc_connection(
+                collection_specs=DATASET_COLLECTION_SPECS, **kwargs
+            )
+        )
+        return cls._build_rds_pair_from_managers(ds_mgr, do_mgr)
+
+    @classmethod
+    def _pair_with_google_drive_testing_connection(
+        cls, **kwargs: Any
+    ) -> tuple["SyftRDSClient", "SyftRDSClient"]:
+        """(ds, do) pair of self-contained RDS clients sharing a REAL Google Drive."""
+        ds_mgr, do_mgr = SyftboxManager._pair_with_google_drive_testing_connection(
+            collection_specs=DATASET_COLLECTION_SPECS, **kwargs
+        )
+        return cls._build_rds_pair_from_managers(ds_mgr, do_mgr)
+
+    def __dir__(self) -> list[str]:
+        """Public API only, without pydantic's machinery."""
+        names = set(type(self).model_fields)
+        for klass in type(self).__mro__:
+            if klass is BaseModel:
+                break
+            names.update(
+                name
+                for name, value in vars(klass).items()
+                if not name.startswith(("_", "model_"))
+                and not isinstance(value, (classmethod, staticmethod))
+            )
+        return sorted(names)
+
+    # ------------------------------------------------------------------ #
+    # delegated identity + sync surface (owned by the generic core)
+    # ------------------------------------------------------------------ #
+    @property
+    def email(self) -> str:
+        return self.sync_engine.email
+
+    @property
+    def syftbox_folder(self) -> Path:
+        return self.sync_engine.syftbox_folder
+
+    @property
+    def has_do_role(self) -> bool:
+        return self.sync_engine.has_do_role
+
+    @property
+    def has_ds_role(self) -> bool:
+        return self.sync_engine.has_ds_role
+
+    @property
+    def peer_manager(self) -> Any:
+        return self.sync_engine.peer_manager
+
+    @property
+    def peers(self) -> Any:
+        """Combined peer list (approved + requests). Delegates to the sync engine.
+
+        Auto-syncs first when ``PRE_SYNC`` is enabled (the engine's behavior).
+        """
+        return self.sync_engine.peers
+
+    def sync(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.sync(*args, **kwargs)
+
+    def add_peer(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.add_peer(*args, **kwargs)
+
+    def approve_peer_request(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.approve_peer_request(*args, **kwargs)
+
+    def reject_peer_request(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.reject_peer_request(*args, **kwargs)
+
+    def load_peers(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.load_peers(*args, **kwargs)
+
+    def validate_peer(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.validate_peer(*args, **kwargs)
+
+    def delete_syftbox(self, *args: Any, **kwargs: Any) -> Any:
+        return self.sync_engine.delete_syftbox(*args, **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # peer lifecycle callbacks (RDS-owned reactions to sync events)
+    # ------------------------------------------------------------------ #
+    def _on_peer_approved(self, peer_email: str) -> None:
+        """A peer was approved: set up their DS job folder and share datasets."""
+        if self.has_do_role:
+            self.job_client.setup_ds_job_folder_as_do(peer_email)
+            self._share_any_datasets_with_peer(peer_email)
+
+    def _on_collection_restored(self, prefix: str, tag: str, local_dir: Any) -> None:
+        """A collection was restored from the backend by the owner-syncer.
+
+        For the PRIVATE dataset collection, rewrite ``private_metadata.yaml``'s
+        machine-specific ``data_dir`` to the current local path, so job execution
+        can locate the real data after a restore onto a new machine/path. This is
+        dataset domain knowledge, so it lives here (rds) rather than the sync core.
+        """
+        if prefix != PRIVATE_DATASET_COLLECTION_PREFIX:
+            return
+
+        metadata_path = Path(local_dir) / "private_metadata.yaml"
+        if not metadata_path.exists():
+            return
+        data = yaml.safe_load(metadata_path.read_text())
+        if not data:
+            # Missing or empty file: nothing to rewrite (and guards against
+            # yaml.safe_load returning None on an empty file).
+            return
+        expected_dir = str(local_dir)
+        if data.get("data_dir") != expected_dir:
+            data["data_dir"] = expected_dir
+            metadata_path.write_text(yaml.safe_dump(data, indent=2, sort_keys=False))
+
+    def _on_peers_loaded(self, *args: Any, **kwargs: Any) -> None:
+        """Peers were (re)loaded: copy each peer's advertised install source
+        into our owned job client so submitted run.sh references the DO's path.
+
+        As a DO, also give every approved peer a requests/ folder, so a peer
+        approved before api requests existed can call apis.
+        """
+        for peer in self.sync_engine.peer_manager.syncable_peers:
+            if peer.version:
+                self.job_client.peer_install_sources[peer.email] = (
+                    peer.version.syft_client_install_source
+                )
+        if self.has_do_role:
+            for peer in self.sync_engine.peer_manager.approved_peers:
+                self.job_client.setup_ds_request_folder_as_do(peer.email)
+
+    def _share_any_datasets_with_peer(self, peer_email: str) -> None:
+        """Share all datasets tagged 'any' with a specific peer.
+
+        Google Drive "anyone with link" files are not discoverable via search,
+        so explicit user sharing is added. Reads the cache populated during
+        ``pull_initial_state()`` in the nested DatasiteOwnerSyncer.
+
+        An "any" dataset holds the layouts its audience read at create time, so
+        a peer approved later may read none of them. Its layout is materialized
+        first, because a grant on a collection the peer cannot list reaches
+        nobody. The new layout is then marked "any" like the rest of the tag,
+        so the next peer finds it in the cache instead of a fresh listing.
+        """
+        cached = self.sync_engine.datasite_owner_syncer.any_shared_collections
+        # The cache holds one entry for each layout, so the backfill is keyed on
+        # the tag and runs once for each dataset.
+        for tag in dict.fromkeys(tag for _, tag, _ in cached):
+            try:
+                self._ensure_dataset_layouts_for(
+                    tag,
+                    [peer_email],
+                    {self._protocol_of(c) for c in self._mock_collections_for(tag)},
+                )
+                # Listed again, not read from the cache: a layout materialized
+                # just now is not in the cache yet, and it is the one this peer
+                # reads.
+                for collection in self._mock_collections_for(tag):
+                    wire_prefix = MOCK_DATASET_SPEC.wire_prefix(collection.variant)
+                    if not collection.has_any_permission:
+                        self.sync_engine.tag_collection_as_any(
+                            wire_prefix, tag, collection.content_hash
+                        )
+                        self.sync_engine.datasite_owner_syncer.register_any_shared_collection(
+                            wire_prefix, tag, collection.content_hash
+                        )
+                    self.sync_engine.share_collection(
+                        wire_prefix, tag, collection.content_hash, [peer_email]
+                    )
+            except Exception:
+                # One dataset failing (missing folder, quota, network) must not
+                # stop us sharing the rest with this peer. Anything reaching
+                # here is a real failure worth a traceback.
+                logger.exception("Failed to share dataset %r with %s", tag, peer_email)
+
+    # ------------------------------------------------------------------ #
+    # job product surface (RDS-owned)
+    # ------------------------------------------------------------------ #
+    def submit_bash_job(
+        self,
+        user: str,
+        script: str,
+        job_name: str = "",
+        force_submission: bool = False,
+        ignore_peer_version: bool = False,
+    ):
+        # Check version compatibility before submission (uses cached versions)
+        if not force_submission:
+            result = self.sync_engine.peer_manager.get_peer_compatibility_status(
+                user,
+                action=CompatAction.SUBMIT,
+                ignore_peer_version=ignore_peer_version,
+            )
+            result.raise_on_skip(operation="submit job")
+            result.maybe_warn()
+        job_dir = self.job_client.submit_bash_job(user, script, job_name=job_name)
+        self.sync_engine.push_job_files(job_dir)
+
+    def submit_python_job(
+        self,
+        user: str,
+        code_path: str,
+        job_name: str | None = "",
+        dependencies: list[str] | None = None,
+        entrypoint: str | None = None,
+        force_submission: bool = False,
+        ignore_peer_version: bool = False,
+        share_logs_with_submitter: bool = False,
+        share_outputs_with_submitter: bool | None = None,
+        share_files: ReadPermissions | None = None,
+    ):
+        """Submit the code at ``code_path`` as a job to ``user``.
+
+        The two flags ask to read stdout/stderr and the outputs; outputs by
+        default unless share_files is given. share_files asks instead as
+        {file: [emails]}, e.g. {"stdout.txt": [me]}.
+        """
+        peer_emails = {p.email for p in self.sync_engine.peer_manager.syncable_peers}
+        if user not in peer_emails:
+            print(f"⚠️  {user} is not in your peer list.")
+            print(f"   Add them first with: client.add_peer('{user}')")
+            return
+
+        if not force_submission:
+            if not run_pre_submit_check(Path(code_path)):
+                print("Submission aborted.")
+                return
+
+        print(f"📤 Submitting '{code_path}' to {user}...")
+        if job_name:
+            print(f"   Job name     : {job_name}")
+        if dependencies:
+            print(f"   Dependencies : {', '.join(dependencies)}")
+
+        # Check version compatibility before submission (uses cached versions)
+        if not force_submission:
+            result = self.sync_engine.peer_manager.get_peer_compatibility_status(
+                user,
+                action=CompatAction.SUBMIT,
+                ignore_peer_version=ignore_peer_version,
+            )
+            result.raise_on_skip(operation="submit job")
+            result.maybe_warn()
+        job_dir = self.job_client.submit_python_job(
+            user,
+            code_path,
+            job_name=job_name,
+            dependencies=dependencies,
+            entrypoint=entrypoint,
+            share_logs_with_submitter=share_logs_with_submitter,
+            share_outputs_with_submitter=share_outputs_with_submitter,
+            share_files=share_files,
+        )
+        self.sync_engine.push_job_files(job_dir)
+
+        print("\n✅ Job submitted successfully!")
+        print("   Status : inbox (waiting for DO to review)")
+        print(f"\n⏳ Next step: wait for {user} to approve and run it.")
+        print("   Check progress with: client.jobs")
+
+    @property
+    def api(self) -> ApiCollection:
+        """Apis shared with you. Auto-syncs first unless PRE_SYNC=false."""
+        if self._pre_sync_enabled:
+            self.sync_engine.sync()
+        return ApiCollection(self)
+
+    def _submit_api_call(
+        self, api: Api, files: dict[str, bytes], block: bool = True
+    ) -> Any:
+        """Send a call of an api as a request holding files.
+
+        Returns the request; with block=True, waits until it was rejected or
+        its job finished, and returns that job.
+        """
+        peer_emails = {p.email for p in self.sync_engine.peer_manager.syncable_peers}
+        if api.datasite not in peer_emails:
+            raise ValueError(f"{api.datasite} is not in your peer list")
+        compat = self.sync_engine.peer_manager.get_peer_compatibility_status(
+            api.datasite, action=CompatAction.SUBMIT
+        )
+        compat.raise_on_skip(operation="submit job")
+        compat.maybe_warn()
+
+        job_name = f"{api.name}-{uuid4().hex[:8]}"
+        job_dir = self.job_client.submit_api_request(
+            api.datasite, job_name, api.name, files
+        )
+        self.sync_engine.push_job_files(job_dir)
+        print(f"✅ Sent request '{job_name}' to {api.datasite} via api '{api.name}'")
+        if block:
+            return self._wait_for_call(job_name)
+        return _named(self.job_client.requests, job_name)
+
+    def _wait_for_call(self, job_name: str, poll_interval: float = 2.0) -> Any:
+        """Sync until the request was rejected or its job finished.
+
+        Returns the job, or the request when it was rejected.
+        """
+        print(f"⏳ Waiting for '{job_name}' to finish (interrupt to stop waiting)...")
+        while True:
+            self.sync_engine.sync()
+            job = _named(self.job_client.jobs, job_name)
+            if job is not None and job.status in FINISHED_JOB_STATUSES:
+                print(f"Job '{job_name}' finished with status: {job.status}")
+                return job
+            request = _named(self.job_client.requests, job_name)
+            if request is not None and request.status == "rejected":
+                print(f"Request '{job_name}' rejected: {request.review_reason}")
+                return request
+            time.sleep(poll_interval)
+
+    @property
+    def _pre_sync_enabled(self) -> bool:
+        """Whether accessors auto-sync (disabled by setting ``PRE_SYNC=false``)."""
+        return os.environ.get("PRE_SYNC", "true").lower() == "true"
+
+    @property
+    def jobs(self) -> Any:
+        """List of jobs. Auto-syncs first unless PRE_SYNC=false."""
+        if self._pre_sync_enabled:
+            self.sync_engine.sync()
+        return self.job_client.jobs
+
+    @property
+    def requests(self) -> Any:
+        """Api calls you sent, or received as DO. Auto-syncs first unless PRE_SYNC=false."""
+        if self._pre_sync_enabled:
+            self.sync_engine.sync()
+        return self.job_client.requests
+
+    # ------------------------------------------------------------------ #
+    # waits for another party (notebook "run all" without re-run cells)
+    # ------------------------------------------------------------------ #
+    def wait_until_peered(
+        self,
+        peer_email: str,
+        timeout: float = DEFAULT_WAIT_TIMEOUT,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+    ) -> Peer:
+        """Wait until ``peer_email`` is a live connection, as ``validate_peer`` checks.
+
+        Raises:
+            TimeoutError: the peer did not approve within ``timeout`` seconds.
+            PeerSetupError: waiting cannot help, e.g. the email is not a peer.
+        """
+        return self.sync_engine.wait_until_peered(
+            peer_email, timeout=timeout, poll_interval=poll_interval
+        )
+
+    def wait_until_has_dataset(
+        self,
+        name: str,
+        datasite: str | None = None,
+        timeout: float = DEFAULT_WAIT_TIMEOUT,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+    ) -> Any:
+        """Sync until the dataset ``name`` is here, and return it.
+
+        ``datasite`` is the owner; it is needed only when more than one owner
+        has a dataset called ``name``.
+
+        Raises:
+            TimeoutError: the dataset did not arrive within ``timeout`` seconds.
+            ValueError: more than one owner has a dataset called ``name``.
+        """
+        return wait_for_dataset(
+            self.sync,
+            self.dataset_manager.get_all,
+            name,
+            datasite,
+            timeout,
+            poll_interval,
+        )
+
+    def wait_until_has_job(
+        self,
+        job_name: str,
+        user_name: str | None = None,
+        status: JobStatusArg = None,
+        where: JobCheck | None = None,
+        timeout: float = DEFAULT_WAIT_TIMEOUT,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+    ) -> Any:
+        """Sync until the job ``job_name`` is here with ``status``, and return it.
+
+        ``user_name`` matches the submitter or the datasite owner; it is needed
+        only when more than one job has the name. ``status`` is one status or
+        several; None accepts any. A job that is done counts for any status
+        before it, because a poll can miss a short status. To wait for a
+        status before ``done``, also pass the statuses after it, for example
+        ``("approved", "running")``. ``where`` is an
+        extra condition on the job, for example
+        ``lambda job: bool(job.output_paths)``.
+
+        Raises:
+            TimeoutError: the job did not match within ``timeout`` seconds.
+            JobEndedError: the job ended with a final status not in ``status``.
+            ValueError: more than one job matches, or ``status`` is not valid.
+        """
+        return wait_for_job(
+            self.sync,
+            lambda: self.job_client.jobs,
+            job_name,
+            user_name,
+            status,
+            where,
+            timeout,
+            poll_interval,
+        )
+
+    def receive_jobs(self) -> None:
+        """Receive new jobs and api calls (DO only). Syncs first unless PRE_SYNC=false.
+
+        A call of an api becomes an approved job; a whole job becomes pending.
+        """
+        if not self.has_do_role:
+            raise ValueError("Only dataset owners can receive jobs")
+        if self._pre_sync_enabled:
+            self.sync_engine.sync()
+        self.job_client.scan_inbox()
+
+    def process_approved_jobs(
+        self,
+        stream_output: bool = True,
+        timeout: int | None = None,
+        force_execution: bool = False,
+        share_logs_with_submitter: bool = False,
+        share_outputs_with_submitter: bool = False,
+        ignore_peer_version: bool = False,
+    ) -> None:
+        """Process approved jobs (DO only). Auto-syncs after unless PRE_SYNC=false."""
+        job_runner = self._job_runner_for_do()
+        skipped: list[tuple[str, str, str]] = []
+
+        if not force_execution:
+            # Only jobs on this client's own datasite: job_client.jobs spans
+            # every datasite in the folder, but the runner never runs a job on
+            # a peer's. Reporting those as skipped would offer a remedy that
+            # cannot help.
+            approved_jobs = [
+                job
+                for job in self.job_client.jobs
+                if job.status == "approved"
+                and job.datasite_owner_email == self.job_client.current_user_email
+            ]
+            for job in approved_jobs:
+                result = self.sync_engine.peer_manager.get_peer_compatibility_status(
+                    job.submitted_by,
+                    action=CompatAction.EXECUTE,
+                    ignore_peer_version=ignore_peer_version,
+                )
+                result.maybe_warn()
+                if result.should_skip:
+                    skipped.append(
+                        (
+                            job.name,
+                            job.submitted_by,
+                            result.explanation_skip or "peer version is not compatible",
+                        )
+                    )
+
+        job_runner.process_approved_jobs(
+            stream_output=stream_output,
+            timeout=timeout,
+            skip_jobs=[(name, peer) for name, peer, _ in skipped] or None,
+            share_logs_with_submitter=share_logs_with_submitter,
+            share_outputs_with_submitter=share_outputs_with_submitter,
+            approved_peers=self._approved_peer_emails(),
+        )
+
+        # maybe_warn() above logs the peer, never the job.
+        if skipped:
+            _print_skipped_jobs(skipped)
+
+        if self._pre_sync_enabled:
+            self.sync_engine.sync()
+
+    def run_job(
+        self,
+        job: JobInfo,
+        stream_output: bool = True,
+        timeout: int | None = None,
+        share_logs_with_submitter: bool = False,
+        share_outputs_with_submitter: bool = False,
+        ignore_peer_version: bool = False,
+        sync: bool = False,
+    ) -> None:
+        """Run one approved job (DO only).
+
+        Raises if the submitter's version is incompatible. Syncs after only
+        with ``sync=True``, so a caller running several jobs syncs once.
+        """
+        job_runner = self._job_runner_for_do()
+        result = self.sync_engine.peer_manager.get_peer_compatibility_status(
+            job.submitted_by,
+            action=CompatAction.EXECUTE,
+            ignore_peer_version=ignore_peer_version,
+        )
+        result.raise_on_skip(operation="run job")
+        result.maybe_warn()
+        job_runner.run_job(
+            job.name,
+            job.submitted_by,
+            stream_output=stream_output,
+            timeout=timeout,
+            share_logs_with_submitter=share_logs_with_submitter,
+            share_outputs_with_submitter=share_outputs_with_submitter,
+            approved_peers=self._approved_peer_emails(),
+        )
+        if sync:
+            self.sync_engine.sync()
+
+    def share_job_results(
+        self,
+        job: JobInfo,
+        share_logs_with_submitter: bool = False,
+        share_outputs_with_submitter: bool = False,
+        share_files: ReadPermissions | None = None,
+        sync: bool = False,
+    ) -> None:
+        """Approve more readers of a finished job's files, and share them (DO only).
+
+        Updates the job's approved read permissions and the file permissions
+        together. A read already given is not taken back. Syncs after only
+        with ``sync=True``.
+        """
+        self._job_runner_for_do().share_job_results(
+            job.name,
+            share_logs_with_submitter=share_logs_with_submitter,
+            share_outputs_with_submitter=share_outputs_with_submitter,
+            user=job.submitted_by,
+            share_files=share_files,
+        )
+        if sync:
+            self.sync_engine.sync()
+
+    def _job_runner_for_do(self) -> SyftJobRunner:
+        """The job runner; raises unless this is a DO client that has one."""
+        if not self.has_do_role:
+            raise ValueError("Only dataset owners can run jobs")
+        if self.job_runner is None:
+            raise ValueError("Job runner is not configured for this client")
+        return self.job_runner
+
+    def _approved_peer_emails(self) -> list[str]:
+        return [p.email for p in self.peer_manager.approved_peers]
+
+    # ------------------------------------------------------------------ #
+    # dataset product surface (RDS-owned)
+    # ------------------------------------------------------------------ #
+    def create_dataset(
+        self,
+        name: str,
+        mock_path: str | Path,
+        private_path: str | Path,
+        summary: str | None = None,
+        readme_path: Path | None = None,
+        location: str | None = None,
+        tags: list[str] | None = None,
+        users: list[str] | str | None = None,
+        upload_private: bool = False,
+        sync=True,
+    ):
+        if self.dataset_manager is None:
+            raise ValueError("Dataset manager is not set")
+
+        # Only DO can create datasets
+        if not self.has_do_role:
+            raise ValueError("Only dataset owners can create datasets")
+
+        # Convert None to empty list
+        if users is None:
+            users = []
+
+        dataset_name = None
+        created_local = False
+        mock_folder_ids: list[str] = []
+        private_folder_ids: list[str] = []
+
+        try:
+            # Create the dataset locally: the current layout, plus one layout
+            # for each older protocol version the audience reads. Resolved here
+            # and not in storage, because "any" is an audience of the approved
+            # peers and only the client holds that list.
+            created = self.dataset_manager.create_all(
+                name=name,
+                mock_path=mock_path,
+                private_path=private_path,
+                summary=summary,
+                readme_path=readme_path,
+                location=location,
+                tags=tags,
+                users=users,
+                protocol_versions=self.dataset_manager.storage.create_protocol_versions(
+                    self._audience_emails(users)
+                ),
+            )
+            created_local = True
+            # The newest copy is the one to hand back to the owner.
+            dataset = created[max(created, key=int)]
+            dataset_name = dataset.name
+
+            # Each copy gets its own collection. The private data of a copy goes
+            # up with it, because the metadata of that copy points at it.
+            for protocol_version in sorted(created, key=int):
+                copy = created[protocol_version]
+                mock_folder_ids.append(self._upload_dataset_to_collection(copy, users))
+                if upload_private:
+                    private_folder_id = self._upload_private_dataset_to_collection(copy)
+                    if private_folder_id is not None:
+                        private_folder_ids.append(private_folder_id)
+
+            if sync:
+                self.sync()
+
+            return dataset
+
+        except Exception:
+            logger.error(
+                "Failed to create dataset%s, cleaning up",
+                f" '{dataset_name}'" if dataset_name else "",
+            )
+            self._cleanup_failed_dataset_creation(
+                dataset_name, created_local, mock_folder_ids, private_folder_ids
+            )
+            raise
+
+    def _cleanup_failed_dataset_creation(
+        self,
+        dataset_name: str | None,
+        created_local: bool,
+        mock_folder_ids: list[str],
+        private_folder_ids: list[str],
+    ) -> None:
+        """Best-effort cleanup after a failed create_dataset, in reverse order."""
+        for private_folder_id in reversed(private_folder_ids):
+            try:
+                self.sync_engine.delete_file_by_id(private_folder_id)
+            except Exception:
+                logger.warning(
+                    "Cleanup: failed to delete private GDrive folder %s",
+                    private_folder_id,
+                )
+
+        for mock_folder_id in reversed(mock_folder_ids):
+            try:
+                self.sync_engine.delete_file_by_id(mock_folder_id)
+            except Exception:
+                logger.warning(
+                    "Cleanup: failed to delete mock GDrive folder %s",
+                    mock_folder_id,
+                )
+
+        if created_local and dataset_name is not None:
+            try:
+                self.dataset_manager.delete(dataset_name, require_confirmation=False)
+            except Exception:
+                logger.warning(
+                    "Cleanup: failed to delete local dataset '%s'",
+                    dataset_name,
+                )
+
+    def _create_and_upload_collection(
+        self, prefix: str, tag: str, files: dict[str, bytes]
+    ) -> tuple[str, str]:
+        """Create a hash-named collection folder and upload its files.
+
+        Returns ``(folder_id, content_hash)``.
+        """
+        from syft.sync.connections.drive.drive_collections import CollectionFolder
+
+        content_hash = CollectionFolder.compute_hash(files)
+        folder_id = self.sync_engine.create_collection_folder(
+            prefix, tag=tag, content_hash=content_hash
+        )
+        self.sync_engine.upload_collection_files(prefix, tag, content_hash, files)
+        return folder_id, content_hash
+
+    def _collect_mock_files(self, dataset) -> dict[str, bytes]:
+        """Read a dataset's mock files, metadata and readme into a name->bytes map."""
+        files = {}
+        for mock_file in dataset.mock_files:
+            if mock_file.exists():
+                files[mock_file.name] = mock_file.read_bytes()
+
+        metadata_path = dataset.mock_dir / "dataset.yaml"
+        if metadata_path.exists():
+            files["dataset.yaml"] = metadata_path.read_bytes()
+
+        if dataset.readme_path and dataset.readme_path.exists():
+            files[dataset.readme_path.name] = dataset.readme_path.read_bytes()
+        return files
+
+    def _share_dataset_collection(
+        self, wire_prefix: str, tag: str, content_hash: str, users: list[str] | str
+    ) -> None:
+        """Share one layout of a dataset with ``users``, or tag it ``"any"`` and
+        share with all already-approved peers.
+
+        Every layout is shared with the whole audience, so a peer that upgrades
+        later moves to the newer layout with no action by the owner.
+        """
+        if users == "any":
+            self.sync_engine.tag_collection_as_any(wire_prefix, tag, content_hash)
+            self.sync_engine.datasite_owner_syncer.register_any_shared_collection(
+                wire_prefix, tag, content_hash
+            )
+            peer_emails = [
+                p.email for p in self.sync_engine.peer_manager.approved_peers
+            ]
+            if peer_emails:
+                self.sync_engine.share_collection(
+                    wire_prefix, tag, content_hash, peer_emails
+                )
+        else:
+            if isinstance(users, str):
+                users = [users]
+            self.sync_engine.share_collection(wire_prefix, tag, content_hash, users)
+
+    def _upload_dataset_to_collection(self, dataset, users: list[str] | str) -> str:
+        """Upload one protocol copy of a dataset. Returns the folder ID.
+
+        Each copy gets its own collection, named for its layout, so a peer picks
+        the newest copy it can read.
+        """
+        variant = dataset_variant(dataset.protocol_version)
+        wire_prefix = MOCK_DATASET_SPEC.wire_prefix(variant)
+        files = self._collect_mock_files(dataset)
+        folder_id, content_hash = self._create_and_upload_collection(
+            wire_prefix, dataset.name, files
+        )
+        self._share_dataset_collection(wire_prefix, dataset.name, content_hash, users)
+        return folder_id
+
+    def _upload_private_dataset_to_collection(self, dataset) -> str | None:
+        """Upload the private files of one protocol copy to an owner-only collection.
+
+        The copies hold separate private directories, so one upload of the newest
+        would leave the others local only and a cold start would not restore them.
+        Returns the folder ID, or None if there are no files to upload.
+        """
+        collection_tag = dataset.name
+
+        # Collect all files in private dir (data, metadata, permissions)
+        files = {}
+        for f in dataset.private_dir.iterdir():
+            if f.is_file():
+                files[f.name] = f.read_bytes()
+
+        if not files:
+            return None
+
+        # Private collection: no sharing step.
+        variant = dataset_variant(dataset.protocol_version)
+        folder_id, _ = self._create_and_upload_collection(
+            PRIVATE_DATASET_SPEC.wire_prefix(variant), collection_tag, files
+        )
+        return folder_id
+
+    def delete_dataset(
+        self,
+        name: str,
+        datasite: str | None = None,
+        require_confirmation: bool = True,
+        sync=True,
+    ):
+        if self.dataset_manager is None:
+            raise ValueError("Dataset manager is not set")
+        self.dataset_manager.delete(
+            name=name,
+            datasite=datasite,
+            require_confirmation=require_confirmation,
+        )
+        # Delete collection folders from Google Drive so DS peers
+        # pick up the deletion on their next sync.
+        try:
+            self.sync_engine.delete_collection(DATASET_COLLECTION_PREFIX, name)
+        except Exception:
+            logger.warning("Failed to delete dataset collection '%s' from Drive", name)
+        try:
+            self.sync_engine.delete_collection(PRIVATE_DATASET_COLLECTION_PREFIX, name)
+        except Exception:
+            logger.warning(
+                "Failed to delete private dataset collection '%s' from Drive",
+                name,
+            )
+        if sync:
+            self.sync()
+
+    def share_dataset(self, tag: str, users: list[str] | str, sync=True):
+        """
+        Share an existing dataset with additional users.
+
+        Args:
+            tag: Dataset name
+            users: List of email addresses or "any"
+            sync: Whether to sync after sharing
+        """
+
+        if self.dataset_manager is None:
+            raise ValueError("Dataset manager is not set")
+
+        if not self.has_do_role:
+            raise ValueError("Only dataset owners can share datasets")
+
+        # Verify dataset exists
+        dataset = self.dataset_manager.get(name=tag, datasite=self.email)
+        if dataset is None:
+            raise ValueError(f"Dataset {tag} not found")
+
+        if users != "any" and isinstance(users, str):
+            users = [users]
+
+        # A dataset has one collection for each layout it was written in. Share
+        # them all, so a peer of any supported version finds a copy. The listing
+        # gives the hash of each copy, so no hash is recomputed here.
+        collections = self._mock_collections_for(tag)
+        if not collections:
+            raise ValueError(f"No uploaded collection found for dataset {tag}")
+
+        # A share is a change of audience. The layouts were decided by the
+        # audience at create time, so a new peer whose protocol reads none of
+        # them would get a grant on a folder its client never even lists.
+        # Materialize what is missing first, then share everything.
+        if self._ensure_dataset_layouts_for(
+            tag, users, {self._protocol_of(c) for c in collections}
+        ):
+            collections = self._mock_collections_for(tag)
+
+        for collection in collections:
+            self._share_dataset_collection(
+                MOCK_DATASET_SPEC.wire_prefix(collection.variant),
+                tag,
+                collection.content_hash,
+                users,
+            )
+
+        # A share changes the audience, so every layout's ruleset records it.
+        # The transport alone would leave the rulesets naming the create-time
+        # audience, and upgrade() recovers the audience from there.
+        self.dataset_manager.grant_read_on_every_layout(tag, users)
+
+        if sync:
+            self.sync()
+
+    def _mock_collections_for(self, tag: str) -> list:
+        """Every uploaded mock-data layout of one dataset."""
+        return [
+            c
+            for c in self.sync_engine._connection_router.owner_list_all_collections_with_permissions(
+                DATASET_COLLECTION_PREFIX
+            )
+            if c.tag == tag
+        ]
+
+    def _private_collections_for(self, tag: str) -> list:
+        """Every uploaded private-data layout of one dataset."""
+        return [
+            c
+            for c in self.sync_engine._connection_router.owner_list_all_collections_with_permissions(
+                PRIVATE_DATASET_COLLECTION_PREFIX
+            )
+            if c.tag == tag
+        ]
+
+    @staticmethod
+    def _protocol_of(collection) -> str:
+        """The dataset protocol version a collection's wire variant stands for."""
+        return collection.variant.removeprefix("v") or "0"
+
+    def _audience_emails(self, users: list[str] | str | None) -> list[str]:
+        """The peers whose layouts an audience needs.
+
+        ``SHARE_WITH_ANY`` is an audience of the approved peers, whose versions
+        we know, so it needs no floor copy. No audience is an empty list: only
+        the current layout is written, and a peer that arrives later gets its
+        layout from the backfill.
+        """
+        if users == SHARE_WITH_ANY:
+            return [p.email for p in self.sync_engine.peer_manager.approved_peers]
+        if users is None:
+            return []
+        if isinstance(users, str):
+            return [users]
+        return list(users)
+
+    def _ensure_dataset_layouts_for(
+        self, tag: str, users: list[str] | str, existing_versions: set[str]
+    ) -> bool:
+        """Materialize any layout the audience reads but no existing copy serves.
+
+        A peer reads every layout at or below its negotiated protocol version,
+        so a copy is only missing when no uploaded collection sits at or below
+        the version a peer reads. The new copy uploads unshared; the caller
+        shares every collection uniformly afterwards. Returns whether a copy
+        was added.
+        """
+        storage = self.dataset_manager.storage
+        needed = storage.target_protocol_versions_for_peers(
+            self._audience_emails(users)
+        )
+        missing = {
+            version
+            for version in needed
+            if not any(int(e) <= int(version) for e in existing_versions)
+        }
+        if not missing:
+            return False
+
+        for protocol_version in sorted(missing, key=int):
+            self._materialize_dataset_copy(tag, protocol_version, users)
+        return True
+
+    def _materialize_dataset_copy(
+        self, tag: str, protocol_version: str, users: list[str] | str
+    ) -> None:
+        """Create and upload one layout copy of an existing dataset.
+
+        The copy uploads unshared; sharing stays with the caller. Each copy
+        holds its own private directory, so the copy gets its private
+        collection iff the dataset's copies are drive-backed -- then a cold
+        start restores it like any other.
+
+        The layout may already be on disk with no collection of its own: an
+        upload can fail after the migrate, and `migrate` is public. A second
+        write of the same layout raises, so an existing copy is read and
+        uploaded instead. Permissions are re-applied either way, because a
+        migrate re-applies them and both paths must leave the same state.
+        """
+        storage = self.dataset_manager.storage
+        try:
+            ref = storage.find_dataset_ref(
+                self.email, tag, protocol_version=protocol_version
+            )
+        except DatasetNotFoundError:
+            copy = self.dataset_manager.migrate(tag, protocol_version, users=users)
+        else:
+            copy = storage.read_dataset(ref)
+            self.dataset_manager._set_new_dataset_permissions(dataset=copy, users=users)
+        self._upload_dataset_to_collection(copy, users=[])
+        if self._private_collections_for(tag):
+            self._upload_private_dataset_to_collection(copy)
+
+    def upgrade(self, *, dry_run: bool = False, sync: bool = True) -> UpgradeReport:
+        """Publish every owned dataset in the protocol layout of this client.
+
+        A dataset's object versions follow its layout directory, so a dataset is
+        promoted by adding the current layout. Every older layout is kept, and a
+        peer that reads one keeps reading it.
+
+        The audience of each dataset is recovered from the ruleset of its newest
+        layout, plus the "any" flag on its collections. A dataset kept by the
+        owner alone stays that way.
+
+        One sweep for each release: a create writes the current layout, so only
+        the datasets of an earlier release need this. A repeat run re-shares
+        each layout with the recovered audience, so a sweep that failed part way
+        through repairs itself. ``dry_run`` reports the plan and writes nothing.
+        """
+        if not self.has_do_role:
+            raise ValueError("Only dataset owners can upgrade datasets")
+        if self.dataset_manager is None:
+            raise ValueError("Dataset manager is not set")
+
+        # Load the peers first: the audience of an "any" dataset is the approved
+        # peers, and a stale map would decide it.
+        self.load_peers()
+
+        report = UpgradeReport(dry_run=dry_run)
+        storage = self.dataset_manager.storage
+        for ref in list(storage.iter_dataset_refs(self.email)):
+            report.datasets.append(self._upgrade_dataset(ref.name, dry_run=dry_run))
+
+        if sync and not dry_run:
+            # Housekeeping. The publish already happened, per dataset.
+            self.sync()
+        return report
+
+    def _upgrade_dataset(self, tag: str, *, dry_run: bool) -> DatasetUpgrade:
+        """Promote one dataset to the current layout, or say why it was skipped."""
+        published = sorted(
+            {self._protocol_of(c) for c in self._mock_collections_for(tag)}, key=int
+        )
+        # Published only. A layout on disk with no collection of its own is the
+        # case _materialize_dataset_copy resumes, so folding the disk into this
+        # skip would drop exactly that case and never publish the copy.
+        already_published = DATASET_PROTOCOL_VERSION in published
+
+        if dry_run:
+            return DatasetUpgrade(
+                tag=tag,
+                published_before=published,
+                published_after=published
+                if already_published
+                else sorted({*published, DATASET_PROTOCOL_VERSION}, key=int),
+                upload_bytes=0
+                if already_published
+                else self._upgrade_upload_bytes(tag),
+                skipped_reason=_ALREADY_PUBLISHED if already_published else None,
+            )
+
+        audience = self._recover_audience(tag)
+        error: str | None = None
+        if not already_published:
+            try:
+                self._materialize_dataset_copy(
+                    tag, DATASET_PROTOCOL_VERSION, users=audience
+                )
+            except Exception as exc:
+                # An added layout is additive, so a partial sweep is safe to
+                # leave. The rest of the datasets still upgrade.
+                logger.exception("Failed to promote dataset %r", tag)
+                error = f"{type(exc).__name__}: {exc}"
+
+        if error is None:
+            # Always, even for a layout that was already published: the promote
+            # uploads unshared, and a share that failed after the upload
+            # succeeded would never be retried otherwise, because the next
+            # sweep sees the layout published and skips it. A share ignores a
+            # grant that already exists, so a repeat costs nothing.
+            try:
+                for collection in self._mock_collections_for(tag):
+                    self._share_dataset_collection(
+                        MOCK_DATASET_SPEC.wire_prefix(collection.variant),
+                        tag,
+                        collection.content_hash,
+                        audience,
+                    )
+            except Exception as exc:
+                logger.exception("Failed to share the layouts of dataset %r", tag)
+                error = f"{type(exc).__name__}: {exc}"
+
+        return DatasetUpgrade(
+            tag=tag,
+            published_before=published,
+            published_after=sorted(
+                {self._protocol_of(c) for c in self._mock_collections_for(tag)},
+                key=int,
+            ),
+            upload_bytes=0
+            if (already_published or error is not None)
+            else self._upgrade_upload_bytes(tag),
+            skipped_reason=_ALREADY_PUBLISHED
+            if (already_published and error is None)
+            else None,
+            error=error,
+        )
+
+    def _recover_audience(self, tag: str) -> list[str] | str:
+        """Who a dataset on disk was shared with.
+
+        Two sources, because a peer reads a dataset through a shared collection
+        and not through ``syft.pub.yaml``: the explicit grants come from the
+        ruleset, and the "any" flag from the collections. "any" has priority,
+        because it is the wider audience and a single bit cannot be recovered
+        from a list of emails.
+        """
+        if any(c.has_any_permission for c in self._mock_collections_for(tag)):
+            return SHARE_WITH_ANY
+        return self.dataset_manager.recover_audience_from_ruleset(tag)
+
+    def _upgrade_upload_bytes(self, tag: str) -> int:
+        """The bytes a promote uploads, measured on the local copy.
+
+        The cost of a sweep is what goes to the transport, not a count of files
+        on disk. The private payload counts too when the copies of the dataset
+        are Drive-backed, because the promote uploads a private collection as
+        well as the mock one.
+        """
+        storage = self.dataset_manager.storage
+        try:
+            ref = storage.find_dataset_ref(
+                self.email, tag, protocol_version=DATASET_PROTOCOL_VERSION
+            )
+        except DatasetNotFoundError:
+            ref = storage.find_dataset_ref(self.email, tag)
+        dataset = storage.read_dataset(ref)
+        total = sum(
+            len(payload) for payload in self._collect_mock_files(dataset).values()
+        )
+        if self._private_collections_for(tag):
+            total += sum(
+                f.stat().st_size for f in dataset.private_dir.iterdir() if f.is_file()
+            )
+        return total
+
+    def share_private_dataset(self, tag: str, enclave_email: str):
+        """Share private dataset files with an enclave via outbox events.
+
+        The files ship at the layout the enclave reads: the newest local copy
+        at or below its negotiated dataset protocol, materialized first when
+        no copy qualifies. An enclave without a known schema is assumed to run
+        the current protocol, the same policy as jobs.
+        """
+        if not self.has_do_role:
+            raise ValueError("Only data owners can share private datasets")
+
+        with self.sync_engine.sync_file_lock():
+            protocol_version = self._private_share_protocol_version(tag, enclave_email)
+            files = self.dataset_manager.get_private_dataset_files(
+                tag, protocol_version=protocol_version
+            )
+            events_message = self.sync_engine.datasite_owner_syncer.event_cache.create_events_for_files(
+                files
+            )
+            self.sync_engine.datasite_owner_syncer.process_events_for_own_state_and_peers(
+                recipients=[enclave_email],
+                file_change_events_message=events_message,
+            )
+
+    def _private_share_protocol_version(self, tag: str, peer_email: str) -> str:
+        """The protocol version of the copy to ship privately to this peer.
+
+        A reader scans every layout at or below its negotiated version, so the
+        newest existing copy at or below it serves; only when none qualifies
+        is a copy at the negotiated version materialized.
+        """
+        storage = self.dataset_manager.storage
+        negotiated = storage.negotiated_protocol_version_for_peer(
+            peer_email, raise_on_unknown=False
+        )
+        readable = {
+            ref.protocol_version
+            for ref in storage.iter_dataset_refs_all_protocols(self.email)
+            if ref.name == tag and int(ref.protocol_version) <= int(negotiated)
+        }
+        if readable:
+            return max(readable, key=int)
+        self._materialize_dataset_copy(tag, negotiated, users=[peer_email])
+        return negotiated
+
+    @property
+    def datasets(self) -> Any:
+        """The dataset manager. Auto-syncs first unless PRE_SYNC=false."""
+        if self.dataset_manager is None:
+            raise ValueError("Dataset manager is not set")
+
+        if self._pre_sync_enabled:
+            self.sync_engine.sync()
+
+        return self.dataset_manager
+
+    def _resolve_dataset_owners_for_name(self, dataset_name: str) -> list:
+        """Resolve which datasite(s) own a dataset of the given name.
+
+        Used by syft.utils.resolve_dataset_files_path when a client is
+        passed. Owned here (drives the RDS dataset manager).
+        """
+        return [
+            dataset.owner
+            for dataset in self.dataset_manager.get_all()
+            if dataset.name == dataset_name
+        ]
+
+    def __repr__(self) -> str:
+        return f"SyftRDSClient(email={self.sync_engine.email!r})"
+
+
+def _named(items: list, name: str) -> Any:
+    """The job or request with this name, or None."""
+    return next((item for item in items if item.name == name), None)

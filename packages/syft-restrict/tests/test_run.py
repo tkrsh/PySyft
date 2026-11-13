@@ -1,0 +1,286 @@
+"""End-to-end tests for run()."""
+
+import hashlib
+import importlib.machinery
+import shutil
+from pathlib import Path
+
+import pytest
+from syft_restrict import (
+    MarkerError,
+    ObfuscationError,
+    PolicyViolation,
+    SourceEncodingError,
+    obfuscate,
+    run,
+)
+from syft_restrict.runner import _run
+from verify.helpers import normalize_source
+
+FIXTURES = Path(__file__).parent / "fixtures"
+ALLOW_FUNCTIONS = ["jax.*", "flax.linen.*"]
+ALLOW_OPERATORS = ["arithmetic", "indexing", "comparison"]
+# Under unicode_escape, the loader decodes \x22 into a closing quote, so print() escapes the
+# string. Read as UTF-8, the block holds one harmless string constant.
+ESCAPING_PRIVATE_BLOCK = (
+    b"# syft-restrict: obfuscate-start\n"
+    b"s = \"\\x22; print('escaped') #\"\n"
+    b"# syft-restrict: obfuscate-end\n"
+)
+
+
+def _loader_code(src: Path):
+    """Compile ``src`` as importlib does when the enclave imports it."""
+    loader = importlib.machinery.SourceFileLoader("model", str(src))
+    return loader.source_to_code(loader.get_data(str(src)), str(src))
+
+
+def _private(source: str):
+    config_line = next(
+        i for i, ln in enumerate(source.splitlines(), 1) if ln.startswith("CONFIG")
+    )
+    return [[config_line, len(source.splitlines())]]
+
+
+def test_run_success_writes_obfuscated_and_certificate(tmp_path):
+    src = tmp_path / "model.py"
+    shutil.copy(FIXTURES / "compliant_model.py", src)
+    result = _run(
+        src,
+        obfuscate=_private(src.read_text()),
+        allow_functions=ALLOW_FUNCTIONS,
+        allow_operators=ALLOW_OPERATORS,
+    )
+    assert result.ok
+    assert result.obfuscated_path is not None and result.certificate is not None
+    out = Path(result.obfuscated_path)
+    assert out.exists() and out.name == "model.obfuscated.py"
+    assert result.certificate["source_sha256"]
+    assert result.certificate["policy_id"]
+    assert result.certificate["restrict_version"]
+    assert result.certificate["n_calls_checked"] > 0
+
+
+def test_run_attaches_advisory_audit_without_affecting_ok(tmp_path):
+    src = tmp_path / "model.py"
+    shutil.copy(FIXTURES / "compliant_model.py", src)
+    result = _run(
+        src,
+        obfuscate=_private(src.read_text()),
+        allow_functions=ALLOW_FUNCTIONS,  # globs -> the audit flags them unsafe
+        allow_operators=ALLOW_OPERATORS,
+    )
+    assert result.ok  # a clean verify still passes
+    assert result.audit is not None
+    assert result.audit.unsafe  # the globs are flagged unsafe by the audit
+    assert (
+        not result.audit.ok
+    )  # the audit is unhappy, yet run().ok stayed True (advisory only)
+
+
+def test_run_audit_attached_on_verification_failure(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text("CONFIG = dict(dim=8)\nleak = x.reshape(1)\n")
+    result = _run(
+        src,
+        obfuscate=[[1, 2]],
+        allow_functions=ALLOW_FUNCTIONS,
+        allow_operators=ALLOW_OPERATORS,
+        strict=False,
+    )
+    assert not result.ok  # verification failed
+    assert result.audit is not None  # the audit is still attached
+    assert result.audit.unsafe  # the globs are flagged unsafe
+
+
+def test_run_survives_a_broken_catalog_dir(tmp_path):
+    # The advisory audit must never fail the run: a malformed catalog degrades, it does not raise.
+    src = tmp_path / "model.py"
+    shutil.copy(FIXTURES / "compliant_model.py", src)
+    bad = tmp_path / "cat" / "_common" / "default"
+    bad.mkdir(parents=True)
+    (bad / "catalog.json").write_text("{ broken json")
+    result = _run(
+        src,
+        obfuscate=_private(src.read_text()),
+        # Globs skip the catalog; a non-glob entry makes the audit read the broken file.
+        allow_functions=[*ALLOW_FUNCTIONS, "jax.numpy.einsum"],
+        allow_operators=ALLOW_OPERATORS,
+        catalog_dir=tmp_path / "cat",
+    )
+    assert result.ok  # a clean verify still passes despite the broken catalog
+    assert result.audit is not None
+
+
+def test_run_strict_raises_and_writes_nothing(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text("CONFIG = dict(dim=8)\nimport os\nleak = os.getcwd()\n")
+    with pytest.raises(PolicyViolation) as exc:
+        _run(
+            src,
+            obfuscate=[[1, 3]],
+            allow_functions=ALLOW_FUNCTIONS,
+            allow_operators=ALLOW_OPERATORS,
+        )
+    assert exc.value.violations
+    assert not (tmp_path / "bad.obfuscated.py").exists()
+
+
+def test_run_nonstrict_returns_violations(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text("CONFIG = dict(dim=8)\nleak = x.reshape(1)\n")
+    result = _run(
+        src,
+        obfuscate=[[1, 2]],
+        allow_functions=ALLOW_FUNCTIONS,
+        allow_operators=ALLOW_OPERATORS,
+        strict=False,
+    )
+    assert not result.ok
+    assert any(v.code == "method-on-value" for v in result.violations)
+    assert result.obfuscated_path is None
+    assert not (tmp_path / "bad.obfuscated.py").exists()
+
+
+def test_run_auto_detects_markers_when_ranges_omitted(tmp_path):
+    src = tmp_path / "model.py"
+    shutil.copy(FIXTURES / "marked_model.py", src)
+    result = run(
+        src,
+        allow_functions=ALLOW_FUNCTIONS,
+        allow_operators=ALLOW_OPERATORS,
+    )
+    assert result.ok
+    assert result.obfuscated_path is not None and result.certificate is not None
+    out = Path(result.obfuscated_path)
+    assert out.exists()
+    # marked_model.py: line 9 is "# syft-restrict: obfuscate-start", line 40 is "...-end" -- the
+    # resolved range excludes both marker lines, so it's (10, 39), not the marker lines themselves.
+    assert result.certificate["obfuscate_ranges"] == [[10, 41]]
+    obfuscated_lines = out.read_text().splitlines()
+    # marker lines fall outside the resolved range, so they pass through untouched -- the reader
+    # can still see exactly where the private region was, even though its contents are renamed.
+    assert obfuscated_lines[8] == "# syft-restrict: obfuscate-start"
+    assert obfuscated_lines[41] == "# syft-restrict: obfuscate-end"
+    assert (
+        "CONFIG" not in out.read_text()
+    )  # the private region's own identifiers were renamed
+
+
+def test_run_without_markers_raises_marker_error(tmp_path):
+    # run() is markers-only: a file with no `# syft-restrict:` markers has no private region to
+    # resolve, so parse_markers() raises rather than silently verifying nothing.
+    src = tmp_path / "unmarked.py"
+    src.write_text(
+        normalize_source("""
+    CONFIG = dict(dim=8)
+    def f(x):
+        return x
+    """)
+    )
+    with pytest.raises(MarkerError):
+        run(src, allow_functions=ALLOW_FUNCTIONS, allow_operators=ALLOW_OPERATORS)
+
+
+def test__run_uses_explicit_ranges_and_ignores_markers(tmp_path):
+    # _run() takes ranges directly and never scans markers, so a stray/unmatched marker in the
+    # source (which would make run()'s parse_markers raise) is simply ignored.
+    src = tmp_path / "model.py"
+    src.write_text(
+        normalize_source("""
+    # syft-restrict: obfuscate-start
+    CONFIG = dict(dim=8)
+    x = CONFIG  # unmatched block, no obfuscate-end
+    """)
+    )
+    result = _run(
+        src,
+        obfuscate=[[1, 3]],
+        allow_functions=ALLOW_FUNCTIONS,
+        allow_operators=ALLOW_OPERATORS,
+    )
+    assert result.ok
+
+
+def test_run_refuses_copy_with_different_row_count(tmp_path, monkeypatch):
+    # No known input makes obfuscate() change the row count, so the test drops a row itself.
+    src = tmp_path / "model.py"
+    shutil.copy(FIXTURES / "marked_model.py", src)
+    monkeypatch.setattr(
+        "syft_restrict.runner._obfuscate",
+        lambda *args: obfuscate(*args).split("\n", 1)[1],
+    )
+
+    # A broken copy is an obfuscator fault, not a verification result, so strict=False raises too.
+    with pytest.raises(ObfuscationError):
+        run(
+            src,
+            allow_functions=ALLOW_FUNCTIONS,
+            allow_operators=ALLOW_OPERATORS,
+            strict=False,
+        )
+    assert not (tmp_path / "model.obfuscated.py").exists()
+
+
+def test_run_refuses_coding_cookie_that_changes_program(tmp_path):
+    # The enclave loads model code with importlib, which honours a PEP 263 coding cookie.
+    src = tmp_path / "model.py"
+    src.write_bytes(b"# -*- coding: unicode_escape -*-\n" + ESCAPING_PRIVATE_BLOCK)
+
+    # Read as UTF-8 (what run() verifies), the file has no call to print...
+    verified = compile(src.read_bytes().decode("utf-8"), str(src), "exec")
+    assert "print" not in verified.co_names
+    # ...but the loader decodes it with the cookie and would call print.
+    assert "print" in _loader_code(src).co_names
+
+    # So run() refuses the file before verifying it, even with strict=False.
+    with pytest.raises(SourceEncodingError):
+        run(
+            src,
+            allow_functions=ALLOW_FUNCTIONS,
+            allow_operators=ALLOW_OPERATORS,
+            strict=False,
+        )
+    assert not (tmp_path / "model.obfuscated.py").exists()
+
+
+def test_run_refuses_coding_cookie_after_lone_cr(tmp_path):
+    # tokenize splits lines only on \n. The loader first turns a lone \r into a line break, so
+    # it reads the cookie on line 2 and decodes the file with it.
+    src = tmp_path / "model.py"
+    src.write_bytes(b"\r# -*- coding: unicode_escape -*-\n" + ESCAPING_PRIVATE_BLOCK)
+    assert "print" in _loader_code(src).co_names
+
+    with pytest.raises(SourceEncodingError):
+        run(src, allow_functions=ALLOW_FUNCTIONS, allow_operators=ALLOW_OPERATORS)
+
+
+def test_run_refuses_invalid_utf8_bytes(tmp_path):
+    src = tmp_path / "model.py"
+    src.write_bytes(b"s = '\xff'\n")
+    with pytest.raises(SourceEncodingError, match="not valid UTF-8"):
+        run(src, allow_functions=ALLOW_FUNCTIONS, allow_operators=ALLOW_OPERATORS)
+
+
+def test_run_accepts_utf8_source_and_verifies_what_loader_runs(tmp_path):
+    # The same private string, declared UTF-8 and holding a non-ASCII character. Here \x22 stays
+    # an escape inside the string, so run() and the loader read the same program.
+    src = tmp_path / "model.py"
+    data = (
+        b"# -*- coding: utf-8 -*-\n"
+        b"# syft-restrict: obfuscate-start\n"
+        + "s = \"café\\x22; print('escaped') #\"\n".encode()
+        + b"# syft-restrict: obfuscate-end\n"
+    )
+    src.write_bytes(data)
+
+    result = run(src, allow_functions=ALLOW_FUNCTIONS, allow_operators=ALLOW_OPERATORS)
+    assert result.ok
+    assert result.certificate is not None
+    # The certificate hashes the exact bytes the loader will read...
+    assert result.certificate["source_sha256"] == hashlib.sha256(data).hexdigest()
+    # ...and the code run() verified is the code the loader compiles.
+    verified = compile(data.decode("utf-8"), str(src), "exec")
+    loaded = _loader_code(src)
+    assert verified == loaded
+    assert "print" not in loaded.co_names

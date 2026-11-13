@@ -1,0 +1,281 @@
+"""Structure, coverage, and behavior of the ProtocolCodecs behind DatasetStorage.
+
+A codec is selected by PROTOCOL version and may serve several of them
+(``protocol_versions``); it also carries its own ``version``. The invariants
+here are about protocol-version coverage: every protocol version the registry
+understands is handled by exactly one codec.
+"""
+
+import importlib
+import inspect
+import pkgutil
+from pathlib import Path
+
+import pytest
+import yaml
+from syft_datasets import protocolcodecs
+from syft_datasets.config import SyftBoxConfig
+from syft_datasets.dataset_storage import DatasetRef, DatasetStorage
+from syft_datasets.migrations import dataset_registry
+from syft_datasets.migrations.registry import DATASET_PROTOCOL_VERSION
+from syft_datasets.models import Dataset, PrivateDatasetConfig
+from syft_datasets.protocolcodecs import ProtocolCodec
+from syft_datasets.protocolcodecs.v1 import DatasetConfigV1
+from syft_datasets.url import SyftBoxURL
+
+DO_EMAIL = "do@test.org"
+
+
+def _storage(tmp_path: Path) -> DatasetStorage:
+    syftbox = tmp_path / "SyftBox"
+    syftbox.mkdir()
+    config = SyftBoxConfig(syftbox_folder=syftbox, email=DO_EMAIL)
+    return DatasetStorage(config=config)
+
+
+def _mock_dataset(storage: DatasetStorage, ref: DatasetRef) -> Dataset:
+    folder = storage.config.syftbox_folder
+    return Dataset(
+        name=ref.name,
+        mock_url=SyftBoxURL.from_path(storage.public_dataset_dir(ref), folder),
+        private_url=SyftBoxURL.from_path(storage.private_dataset_dir(ref), folder),
+    )
+
+
+# -- structural invariant ------------------------------------------------------
+def test_codec_versions_unique_and_protocol_versions_disjoint(tmp_path: Path):
+    codecs = _storage(tmp_path).codecs
+
+    codec_versions = [c.version for c in codecs]
+    assert len(codec_versions) == len(set(codec_versions)), (
+        "codec versions must be unique"
+    )
+
+    seen: set[str] = set()
+    for codec in codecs:
+        for protocol_version in codec.protocol_versions:
+            assert protocol_version not in seen, (
+                f"protocol {protocol_version} handled by more than one codec"
+            )
+            seen.add(protocol_version)
+
+    # The current protocol is handled by the last (newest) codec.
+    assert DATASET_PROTOCOL_VERSION in codecs[-1].protocol_versions
+
+
+def _all_concrete_codec_classes() -> set[type[ProtocolCodec]]:
+    for module_info in pkgutil.iter_modules(protocolcodecs.__path__):
+        importlib.import_module(f"{protocolcodecs.__name__}.{module_info.name}")
+
+    def descendants(cls: type) -> set[type]:
+        subs = set(cls.__subclasses__())
+        return subs.union(*(descendants(s) for s in subs))
+
+    return {cls for cls in descendants(ProtocolCodec) if not inspect.isabstract(cls)}
+
+
+# -- registration --------------------------------------------------------------
+def test_all_codecs_in_codebase_are_registered_in_dataset_storage(tmp_path: Path):
+    registered_codecs = {type(codec) for codec in _storage(tmp_path).codecs}
+    defined_codecs = _all_concrete_codec_classes()
+
+    missing = defined_codecs - registered_codecs
+    assert not missing, (
+        f"codec(s) defined but not registered in DatasetStorage/CODECS: "
+        f"{sorted(cls.__name__ for cls in missing)}"
+    )
+
+
+# -- coverage ------------------------------------------------------------------
+def test_every_known_protocol_version_is_covered_by_exactly_one_codec(tmp_path: Path):
+    storage = _storage(tmp_path)
+
+    known = set(dataset_registry.protocol_version_history) | {DATASET_PROTOCOL_VERSION}
+    covered = {pv for codec in storage.codecs for pv in codec.protocol_versions}
+    assert covered == known
+
+    for protocol_version in known:
+        assert storage._codec_for(protocol_version) is not None
+
+
+# -- behavior 1: on-disk format per codec --------------------------------------
+def test_v0_writes_flat_no_identity_v1_nests_with_identity(tmp_path: Path):
+    storage = _storage(tmp_path)
+
+    ref0 = DatasetRef(DO_EMAIL, "flat", "0")
+    ref1 = DatasetRef(DO_EMAIL, "nested", "1")
+    p0 = storage.write_dataset_metadata(ref0, _mock_dataset(storage, ref0))
+    p1 = storage.write_dataset_metadata(ref1, _mock_dataset(storage, ref1))
+
+    # protocol 0: public/syft_datasets/<name>/dataset.yaml (no v<n>), identity stripped
+    assert p0.parent.parent.name == "syft_datasets"
+    raw0 = yaml.safe_load(p0.read_text())
+    assert "canonical_name" not in raw0 and "version" not in raw0
+
+    # protocol 1: public/syft_datasets/v1/<name>/dataset.yaml, identity present
+    assert p1.parent.parent.name == "v1"
+    raw1 = yaml.safe_load(p1.read_text())
+    assert raw1["canonical_name"] == "Dataset" and raw1["version"] == "1"
+
+    for ref in (ref0, ref1):
+        loaded = storage.read_dataset(ref)
+        assert loaded.name == ref.name
+        assert loaded.version == dataset_registry.latest_version("Dataset")
+
+
+def test_wire_bytes_match_write_and_strip_private_config_identity_on_v0(tmp_path: Path):
+    storage = _storage(tmp_path)
+    ref0 = DatasetRef(DO_EMAIL, "flat", "0")
+    ref1 = DatasetRef(DO_EMAIL, "nested", "1")
+    dataset = _mock_dataset(storage, ref0)
+    config = PrivateDatasetConfig(uid=dataset.uid, data_dir=Path("/secret/local/path"))
+
+    p0 = storage.write_private_config(ref0, config)
+    p1 = storage.write_private_config(ref1, config)
+
+    assert storage.wire_bytes(ref0, config) == p0.read_bytes()
+    assert storage.wire_bytes(ref1, config) == p1.read_bytes()
+
+    raw0 = yaml.safe_load(p0.read_text())
+    assert "canonical_name" not in raw0 and "version" not in raw0
+    assert list(raw0) == ["uid", "data_dir"]
+
+    raw1 = yaml.safe_load(p1.read_text())
+    assert raw1["canonical_name"] == "PrivateDatasetConfig" and raw1["version"] == "1"
+
+
+@pytest.fixture
+def private_config_v2():
+    """A throwaway PrivateDatasetConfig V2, as the next release would ship it.
+
+    Subclassing a registered class registers it, so this lands in the global
+    dataset_registry; the teardown pops it back out, because the registry has no
+    deregister call and another test must not see a version "2".
+    """
+    from syft_datasets.models import PrivateDatasetConfigV1
+
+    # The class body registers V2, so everything after it needs the teardown.
+    class PrivateDatasetConfigV2(PrivateDatasetConfigV1, registry=dataset_registry):
+        version: str = "2"
+        checksum: str = ""
+
+    try:
+        dataset_registry.register_migration(
+            canonical_name="PrivateDatasetConfig",
+            from_version="1",
+            to_version="2",
+            fn=lambda obj: PrivateDatasetConfigV2(
+                **obj.model_dump(exclude={"version"})
+            ),
+        )
+        yield PrivateDatasetConfigV2
+    finally:
+        dataset_registry.objects["PrivateDatasetConfig"].pop("2", None)
+        dataset_registry.migrations.get("PrivateDatasetConfig", {}).pop(
+            ("1", "2"), None
+        )
+
+
+def test_dataset_private_config_upgrades_a_v1_file_to_the_latest_version(
+    tmp_path: Path, private_config_v2
+):
+    # Dataset.private_config must read through storage, which upgrades. Reading the
+    # file into PrivateDatasetConfigV1 by name would return version 1 forever.
+    storage = _storage(tmp_path)
+    ref = DatasetRef(DO_EMAIL, "demo", "1")
+    dataset = _mock_dataset(storage, ref)
+    storage.write_dataset_metadata(ref, dataset)
+
+    path = storage.private_metadata_path(ref)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "canonical_name": "PrivateDatasetConfig",
+                "version": "1",
+                "uid": str(dataset.uid),
+                "data_dir": "",
+            },
+            indent=2,
+            sort_keys=False,
+        )
+    )
+
+    config = storage.read_dataset(ref).private_config
+
+    assert isinstance(config, private_config_v2)
+    assert config.version == "2"
+    # The uid comes from the file, so a fresh V2 that ignored it would fail here.
+    assert config.uid == dataset.uid
+
+
+# -- behavior 2: each codec scans only its own layout --------------------------
+def test_scan_partitions_by_layout(tmp_path: Path):
+    storage = _storage(tmp_path)
+    v0_codec, v1_codec = storage._codec_for("0"), storage._codec_for("1")
+
+    ref0 = DatasetRef(DO_EMAIL, "flat", "0")
+    ref1 = DatasetRef(DO_EMAIL, "nested", "1")
+    storage.write_dataset_metadata(ref0, _mock_dataset(storage, ref0))
+    storage.write_dataset_metadata(ref1, _mock_dataset(storage, ref1))
+
+    v0_refs = list(v0_codec.iter_dataset_refs(DO_EMAIL))
+    v1_refs = list(v1_codec.iter_dataset_refs(DO_EMAIL))
+    assert [(r.name, r.protocol_version) for r in v0_refs] == [("flat", "0")]
+    assert [(r.name, r.protocol_version) for r in v1_refs] == [("nested", "1")]
+
+    all_refs = list(storage.iter_dataset_refs_all_protocols(DO_EMAIL))
+    assert {(r.name, r.protocol_version) for r in all_refs} == {
+        ("flat", "0"),
+        ("nested", "1"),
+    }
+    assert len(all_refs) == 2
+
+
+def test_iter_dataset_refs_prefers_newest_protocol(tmp_path: Path):
+    storage = _storage(tmp_path)
+
+    # Same dataset written in two protocol layouts (as for a mixed audience).
+    ref0 = DatasetRef(DO_EMAIL, "demo", "0")
+    ref1 = DatasetRef(DO_EMAIL, "demo", "1")
+    storage.write_dataset_metadata(ref0, _mock_dataset(storage, ref0))
+    storage.write_dataset_metadata(ref1, _mock_dataset(storage, ref1))
+
+    # all-protocols sees both copies; the public iterator collapses to the newest.
+    all_refs = list(storage.iter_dataset_refs_all_protocols(DO_EMAIL))
+    assert {r.protocol_version for r in all_refs} == {"0", "1"}
+
+    preferred = list(storage.iter_dataset_refs(DO_EMAIL))
+    assert [(r.name, r.protocol_version) for r in preferred] == [("demo", "1")]
+    assert storage.find_dataset_ref(DO_EMAIL, "demo").protocol_version == "1"
+
+
+# -- behavior 3: one codec serves many protocol versions, segment from the ref --
+def test_v1_codec_serves_multiple_protocols_with_derived_segment(tmp_path: Path):
+    syftbox = tmp_path / "SyftBox"
+    syftbox.mkdir()
+    config = SyftBoxConfig(syftbox_folder=syftbox, email=DO_EMAIL)
+    cfg = DatasetConfigV1(config)
+    # Simulate a protocol bump that did not change the layout: the same codec now
+    # serves protocol 2 as well, purely by extending its supported versions.
+    cfg.protocol_versions = ["1", "2"]
+
+    # The v<n> segment is derived from each ref's protocol version, not hardcoded.
+    assert cfg.public_dataset_dir(DatasetRef(DO_EMAIL, "a", "1")).parent.name == "v1"
+    assert cfg.public_dataset_dir(DatasetRef(DO_EMAIL, "b", "2")).parent.name == "v2"
+
+    # A ref with no versioned segment (e.g. protocol 0) must not resolve here.
+    with pytest.raises(ValueError):
+        cfg.public_dataset_dir(DatasetRef(DO_EMAIL, "x", "0"))
+
+    # Lay a dataset down in each segment; iteration finds both, tagged correctly.
+    for name, version in (("a", "1"), ("b", "2")):
+        dataset_dir = cfg.public_dataset_dir(DatasetRef(DO_EMAIL, name, version))
+        dataset_dir.mkdir(parents=True)
+        (dataset_dir / cfg.metadata_filename).write_text("{}")
+
+    found = {
+        (r.name, r.protocol_version)
+        for r in cfg.iter_dataset_refs_all_supported_protocols(DO_EMAIL)
+    }
+    assert found == {("a", "1"), ("b", "2")}

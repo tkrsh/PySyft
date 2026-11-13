@@ -1,0 +1,640 @@
+import copy
+import json
+import pickle
+from pathlib import Path
+
+import pytest
+
+from syft.sync.encryption_policy import EncryptionPolicy
+from syft.sync.peers.exceptions import SyftPeerNotReadyError
+from syft.sync.peers.peer import Peer, PeerState
+from syft.sync.peers.peer_store import PeerStore, import_key_file
+from syft.sync.syftbox_manager import SyftboxManager
+from tests.unit.test_sync_manager import path_for_job
+from tests.unit.utils import grant_job_inbox_access
+from syft.sync.connections.drive.drive_connections import drive_cached_client_of
+
+
+# =========================================================================
+# PeerStore unit tests
+# =========================================================================
+
+
+def test_key_generation():
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+    assert ps.public_key is not None
+    assert ps.get_public_bundle() is not None
+
+
+def test_encrypt_decrypt_roundtrip():
+    alice = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    alice.generate_keys()
+    bob = PeerStore(
+        email="bob@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    bob.generate_keys()
+
+    # Add peers so bundles can be stored on Peer objects
+    alice.add_peer(Peer(email="bob@example.com"))
+    bob.add_peer(Peer(email="alice@example.com"))
+
+    # Exchange bundles
+    alice.set_peer_bundle("bob@example.com", bob.get_public_bundle())
+    bob.set_peer_bundle("alice@example.com", alice.get_public_bundle())
+
+    plaintext = b"Hello, this is a secret message!"
+    envelope = alice.encrypt("bob@example.com", plaintext)
+    assert envelope != plaintext
+
+    decrypted = bob.decrypt("alice@example.com", envelope)
+    assert decrypted == plaintext
+
+
+def test_encrypt_without_keys_raises():
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.add_peer(Peer(email="bob@example.com"))
+    with pytest.raises(ValueError, match="Keys are created at login"):
+        ps.encrypt("bob@example.com", b"data")
+
+
+@pytest.mark.parametrize(
+    "state, cause, remedy",
+    [
+        (
+            PeerState.ACCEPTED,
+            "accepted peer, but you do not have their public",
+            "Run client.sync()",
+        ),
+        (
+            PeerState.REQUESTED_BY_ME,
+            "they have not accepted yet",
+            "Wait for them to accept",
+        ),
+        (
+            PeerState.REQUESTED_BY_PEER,
+            "you have not accepted yet",
+            "client.approve_peer_request('bob@example.com')",
+        ),
+        (
+            PeerState.REJECTED,
+            "You rejected bob@example.com",
+            "client.add_peer('bob@example.com')",
+        ),
+    ],
+)
+def test_encrypt_without_peer_bundle_names_the_cause(state, cause, remedy):
+    """A missing bundle means one of four things; the message must say which.
+
+    Naming neither the cause nor the remedy is what left data owners stuck on
+    this error with nothing to act on.
+    """
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+    ps.add_peer(Peer(email="bob@example.com", state=state))
+
+    with pytest.raises(SyftPeerNotReadyError) as exc:
+        ps.encrypt("bob@example.com", b"data")
+
+    assert cause in exc.value.cause
+    assert remedy in exc.value.remedy
+    assert str(exc.value) == f"{exc.value.cause} {exc.value.remedy}"
+
+
+def test_peer_not_ready_error_is_a_value_error():
+    """Callers that catch ValueError keep working."""
+    assert issubclass(SyftPeerNotReadyError, ValueError)
+
+
+def test_peer_not_ready_error_survives_pickle_and_copy():
+    error = SyftPeerNotReadyError("p@test.org", cause="Cause.", remedy="Remedy.")
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+        assert (clone.peer_email, clone.cause, clone.remedy) == (
+            "p@test.org",
+            "Cause.",
+            "Remedy.",
+        )
+        assert str(clone) == "Cause. Remedy."
+
+
+def test_try_decrypt_no_keys():
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    data = b"some unencrypted data"
+    with pytest.raises(ValueError, match="Keys are created at login"):
+        ps.decrypt("bob@example.com", data) == data
+
+
+def test_try_decrypt_no_peer_bundle():
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+    data = b"some unencrypted data"
+    with pytest.raises(SyftPeerNotReadyError) as exc:
+        ps.decrypt("bob@example.com", data)
+    assert "No cached peer for bob@example.com" in exc.value.cause
+    assert "client.add_peer('bob@example.com')" in exc.value.remedy
+
+
+def test_try_decrypt_invalid_envelope():
+    alice = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    alice.generate_keys()
+    bob = PeerStore(
+        email="bob@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    bob.generate_keys()
+
+    alice.add_peer(Peer(email="bob@example.com"))
+    bob.add_peer(Peer(email="alice@example.com"))
+
+    alice.set_peer_bundle("bob@example.com", bob.get_public_bundle())
+    bob.set_peer_bundle("alice@example.com", alice.get_public_bundle())
+
+    bad_data = b"not encrypted at all"
+    with pytest.raises(ValueError, match="Serialization error"):
+        bob.decrypt("alice@example.com", bad_data)
+
+
+def test_key_file_holds_identity_only(tmp_path):
+    keys_path = tmp_path / "crypto_keys.json"
+    alice = PeerStore.create(email="alice@example.com", keys_path=keys_path)
+    bob = PeerStore(email="bob@example.com")
+    bob.generate_keys()
+    alice.add_peer(Peer(email="bob@example.com"))
+    alice.set_peer_bundle("bob@example.com", bob.get_public_bundle())
+
+    assert set(json.loads(keys_path.read_text())) == {"version", "email", "keys_jwk"}
+    reloaded = PeerStore.create(email="alice@example.com", keys_path=keys_path)
+    assert reloaded.get_public_bundle() == alice.get_public_bundle()
+    assert not reloaded.has_peer_bundle("bob@example.com")
+
+
+def _session_key_file(tmp_path, email="alice@example.com"):
+    path = tmp_path / "upload" / "crypto_keys.json"
+    return path, PeerStore.create(email=email, keys_path=path)
+
+
+def test_imported_key_file_restores_keys(tmp_path):
+    uploaded, earlier = _session_key_file(tmp_path)
+    keys_path = tmp_path / "SyftBox" / "crypto_keys.json"
+
+    import_key_file(uploaded, keys_path, "alice@example.com")
+
+    restored = PeerStore.create(email="alice@example.com", keys_path=keys_path)
+    assert restored.get_public_bundle() == earlier.get_public_bundle()
+
+
+def test_import_same_key_file_twice(tmp_path):
+    uploaded, _ = _session_key_file(tmp_path)
+    keys_path = tmp_path / "SyftBox" / "crypto_keys.json"
+    import_key_file(uploaded, keys_path, "alice@example.com")
+
+    import_key_file(uploaded, keys_path, "alice@example.com")
+
+
+def test_import_key_file_of_another_identity_refused(tmp_path):
+    uploaded, _ = _session_key_file(tmp_path, email="bob@example.com")
+    keys_path = tmp_path / "SyftBox" / "crypto_keys.json"
+
+    with pytest.raises(ValueError, match="belongs to"):
+        import_key_file(uploaded, keys_path, "alice@example.com")
+    assert not keys_path.exists()
+
+
+def test_import_never_replaces_other_keys(tmp_path):
+    uploaded, _ = _session_key_file(tmp_path)
+    keys_path = tmp_path / "SyftBox" / "crypto_keys.json"
+    PeerStore.create(email="alice@example.com", keys_path=keys_path)
+    on_disk = keys_path.read_text()
+
+    with pytest.raises(FileExistsError):
+        import_key_file(uploaded, keys_path, "alice@example.com")
+    assert keys_path.read_text() == on_disk
+
+
+# =========================================================================
+# Full DS→DO→DS flow with encryption via mock drive
+# =========================================================================
+
+
+def test_encrypted_message_flow():
+    """Full sync flow with encryption: DS sends message, DO receives and decrypts."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+
+    # Verify peer stores are set with encryption enabled
+    assert ds_manager._peer_store is not None
+    assert do_manager._peer_store is not None
+
+    # DO has DS's bundle after approval
+    do_ps = do_manager._peer_store
+    assert do_ps.has_peer_bundle(ds_manager.email)
+
+    # DS needs to load_peers to pick up DO's bundle
+    ds_manager.load_peers()
+    ds_ps = ds_manager._peer_store
+    assert ds_ps.has_peer_bundle(do_manager.email)
+
+    # DS sends a file change (encrypted)
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "encrypted content")
+
+    # DO syncs and should receive the decrypted content
+    do_manager.sync()
+
+    events = do_manager._get_all_accepted_events_do()
+    assert len(events) > 0
+
+    all_events = [e for msg in events for e in msg.events]
+    matching = [e for e in all_events if "encrypted content" in str(e.content)]
+    assert len(matching) > 0
+
+
+def test_encrypted_sync_down_ds():
+    """DS can pull encrypted events from DO outbox."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+
+    # DS needs DO's bundle to decrypt
+    ds_manager.load_peers()
+
+    # DS sends a file
+    file_path = path_for_job(do_manager.email, ds_manager.email)
+    ds_manager._send_file_change(file_path, "test data")
+
+    # DO syncs (receives and processes)
+    do_manager.sync()
+
+    # DS syncs down (pulls encrypted events from DO outbox)
+    ds_manager.sync()
+
+    # DS should have cached events
+    cached = (
+        ds_manager.datasite_watcher_syncer.datasite_watcher_cache.get_cached_events()
+    )
+    assert len(cached) > 0
+
+
+def test_no_encryption_backward_compat():
+    """Without encryption, everything works as before."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=False,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "hello unencrypted")
+    do_manager.sync()
+
+    events = do_manager._get_all_accepted_events_do()
+    assert len(events) > 0
+
+
+def test_bundle_exchange_through_peer_approval():
+    """Bundles are exchanged during add_peer/approve flow."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+        add_peers=False,
+    )
+
+    ds_ps = ds_manager._peer_store
+    do_ps = do_manager._peer_store
+
+    # Before peer add, no peer bundles
+    assert not ds_ps.has_peer_bundle(do_manager.email)
+    assert not do_ps.has_peer_bundle(ds_manager.email)
+
+    # DS adds peer (writes bundle)
+    ds_manager.add_peer(do_manager.email)
+
+    # DO loads peers and approves (reads DS bundle, writes own)
+    do_manager.load_peers()
+    do_manager.approve_peer_request(ds_manager.email)
+
+    # DO should now have DS's bundle
+    assert do_ps.has_peer_bundle(ds_manager.email)
+
+    # DS loads peers again to pick up DO's bundle
+    ds_manager.load_peers()
+    assert ds_ps.has_peer_bundle(do_manager.email)
+
+
+# =========================================================================
+# Self-encryption (at-rest) tests
+# =========================================================================
+
+
+def test_self_encrypt_decrypt_roundtrip():
+    """PeerStore can encrypt and decrypt data for itself."""
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+
+    plaintext = b"secret at-rest data"
+    encrypted = ps.encrypt_for_self(plaintext)
+    assert encrypted != plaintext
+
+    decrypted = ps.decrypt_for_self(encrypted)
+    assert decrypted == plaintext
+
+
+def test_self_encrypt_if_needed_with_encryption():
+    """encrypt_for_self_if_needed encrypts when enabled and keys exist."""
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+
+    data = b"hello"
+    encrypted = ps.encrypt_for_self_if_needed(data)
+    assert encrypted != data
+
+    decrypted = ps.decrypt_and_verify_for_self_if_needed(encrypted)
+    assert decrypted == data
+
+
+def test_self_encrypt_if_needed_without_encryption():
+    """encrypt_for_self_if_needed is a no-op when encryption is disabled."""
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.OPTIONAL
+    )
+    ps.generate_keys()
+
+    data = b"hello"
+    assert ps.encrypt_for_self_if_needed(data) == data
+    assert ps.decrypt_and_verify_for_self_if_needed(data) == data
+
+
+def test_required_self_decrypt_refuses_plaintext():
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+
+    with pytest.raises(ValueError, match="SYC envelope"):
+        ps.decrypt_and_verify_for_self_if_needed(b"hello")
+
+
+# =========================================================================
+# At-rest encryption via mock drive: events, checkpoints, rolling state
+# =========================================================================
+
+
+def test_encrypted_events_at_rest():
+    """DO events are encrypted at rest and decrypted on read back."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+    ds_manager.load_peers()
+
+    # DS sends a file change
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "at-rest encrypted")
+    do_manager.sync()
+
+    # Read back events — should be decrypted transparently
+    events = do_manager._get_all_accepted_events_do()
+    assert len(events) > 0
+    all_events = [e for msg in events for e in msg.events]
+    matching = [e for e in all_events if "at-rest encrypted" in str(e.content)]
+    assert len(matching) > 0
+
+
+def test_encrypted_checkpoint_roundtrip():
+    """Checkpoint is encrypted at rest and decrypted on read."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+    ds_manager.load_peers()
+
+    # Create some data and a checkpoint
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "checkpoint data")
+    do_manager.sync()
+
+    checkpoint = do_manager.datasite_owner_syncer.create_checkpoint()
+    assert len(checkpoint.files) > 0
+
+    # Read back checkpoint — should decrypt transparently
+    loaded = do_manager._connection_router.get_latest_checkpoint()
+    assert loaded is not None
+    assert len(loaded.files) == len(checkpoint.files)
+
+
+def test_encrypted_rolling_state_roundtrip():
+    """Rolling state is encrypted at rest and decrypted on read."""
+    from syft.sync.checkpoints.rolling_state import RollingState
+    from syft.sync.events.file_change_event import (
+        FileChangeEvent,
+        FileChangeEventsMessage,
+    )
+    from uuid import uuid4
+
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+
+    # Create and upload rolling state
+    rs = RollingState(email=do_manager.email, base_checkpoint_timestamp=0.0)
+    event = FileChangeEvent(
+        id=uuid4(),
+        path_in_datasite=Path("test/file.txt"),
+        content=b"rolling state content",
+        old_hash=None,
+        new_hash="abc123",
+        is_deleted=False,
+        submitted_timestamp=1.0,
+        timestamp=1.0,
+        datasite_email=do_manager.email,
+    )
+    rs.add_events_message(FileChangeEventsMessage(events=[event]))
+
+    do_manager._connection_router.upload_rolling_state(rs)
+
+    # Read back — should decrypt transparently
+    loaded = do_manager._connection_router.get_rolling_state()
+    assert loaded is not None
+    assert loaded.event_count == 1
+
+
+def test_at_rest_no_encryption_backward_compat():
+    """Events, checkpoints, rolling state work without encryption."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=False,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "unencrypted data")
+    do_manager.sync()
+
+    events = do_manager._get_all_accepted_events_do()
+    assert len(events) > 0
+
+    checkpoint = do_manager.datasite_owner_syncer.create_checkpoint()
+    assert len(checkpoint.files) > 0
+
+    loaded = do_manager._connection_router.get_latest_checkpoint()
+    assert loaded is not None
+    assert len(loaded.files) == len(checkpoint.files)
+
+
+# =========================================================================
+# Signature verification tests
+# =========================================================================
+
+
+def _setup_alice_bob():
+    """Helper: create alice and bob PeerStores with exchanged bundles."""
+    alice = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    alice.generate_keys()
+    bob = PeerStore(
+        email="bob@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    bob.generate_keys()
+
+    alice.add_peer(Peer(email="bob@example.com"))
+    bob.add_peer(Peer(email="alice@example.com"))
+
+    alice.set_peer_bundle("bob@example.com", bob.get_public_bundle())
+    bob.set_peer_bundle("alice@example.com", alice.get_public_bundle())
+    return alice, bob
+
+
+def test_verify_message():
+    """Verify signature of a message from a known sender."""
+    alice, bob = _setup_alice_bob()
+
+    plaintext = b"signed message"
+    envelope = alice.encrypt("bob@example.com", plaintext)
+
+    # Bob verifies Alice's signature — should not raise
+    bob.verify_message("alice@example.com", envelope)
+
+
+def test_verify_message_wrong_sender_raises():
+    """Verification fails when checked against the wrong sender's key."""
+    alice, bob = _setup_alice_bob()
+
+    carol = PeerStore(
+        email="carol@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    carol.generate_keys()
+    bob.add_peer(Peer(email="carol@example.com"))
+    bob.set_peer_bundle("carol@example.com", carol.get_public_bundle())
+
+    envelope = alice.encrypt("bob@example.com", b"hello")
+
+    with pytest.raises(Exception):
+        bob.verify_message("carol@example.com", envelope)
+
+
+def test_decrypt_tampered_envelope_raises():
+    """Decrypting a tampered envelope should raise."""
+    alice, bob = _setup_alice_bob()
+
+    envelope = alice.encrypt("bob@example.com", b"secret")
+    tampered = bytearray(envelope)
+    tampered[-1] ^= 0xFF
+    tampered = bytes(tampered)
+
+    with pytest.raises(Exception):
+        bob.decrypt("alice@example.com", tampered)
+
+
+def test_verify_message_from_self():
+    """Verify signature of a self-encrypted envelope."""
+    ps = PeerStore(
+        email="alice@example.com", encryption_policy=EncryptionPolicy.REQUIRED
+    )
+    ps.generate_keys()
+
+    plaintext = b"self-signed data"
+    envelope = ps.encrypt_for_self(plaintext)
+
+    # Should not raise
+    ps.verify_message_from_self(envelope)
+
+
+# =========================================================================
+# E2E signature verification through mock drive sync
+# =========================================================================
+
+
+def test_verified_encrypted_message_flow():
+    """Good message passes signature verification + decryption through full sync."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+
+    grant_job_inbox_access(do_manager, ds_manager.email)
+    ds_manager.load_peers()
+
+    # DS sends a file change (encrypted + signed)
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "verified content")
+
+    # DO syncs — decrypt_and_verify_if_needed runs internally
+    do_manager.sync()
+
+    events = do_manager._get_all_accepted_events_do()
+    assert len(events) > 0
+    all_events = [e for msg in events for e in msg.events]
+    matching = [e for e in all_events if "verified content" in str(e.content)]
+    assert len(matching) > 0
+
+
+def test_tampered_inbox_message_is_archived_with_warning():
+    """Tampered message in mock inbox cannot be read on sync, so it is archived
+    with a warning instead of blocking the inbox."""
+    ds_manager, do_manager = SyftboxManager.pair_with_mock_drive_service_connection(
+        encryption=True,
+    )
+    ds_manager.load_peers()
+
+    # DS sends a file change
+    file_path = path_for_job(do_manager.email, ds_manager.email, "my.job")
+    ds_manager._send_file_change(file_path, "will be tampered")
+
+    # Tamper with raw bytes in the mock backing store
+    do_cached_client = drive_cached_client_of(do_manager._connection_router.connections)
+    inbox_id = do_cached_client.get_own_datasite_inbox_id(ds_manager.email)
+    files = do_cached_client.get_file_metadatas_from_folder(inbox_id)
+    assert len(files) > 0
+
+    file_id = files[0]["id"]
+    mock_file = do_cached_client.client.drive_service._backing_store.files[file_id]
+    tampered = bytearray(mock_file.content)
+    tampered[-1] ^= 0xFF
+    mock_file.content = bytes(tampered)
+
+    with pytest.warns(UserWarning, match="unread"):
+        do_manager.sync()
+    assert do_cached_client.get_file_metadatas_from_folder(inbox_id) == []

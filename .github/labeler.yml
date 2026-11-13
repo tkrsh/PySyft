@@ -1,0 +1,54 @@
+pkg:syft:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'syft/**'
+
+pkg:syft-bg:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-bg/**'
+
+pkg:syft-job:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-job/**'
+
+pkg:syft-dataset:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-datasets/**'
+
+pkg:syft-perms:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-perms/**'
+
+pkg:syft-permissions:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-permissions/**'
+
+pkg:syft-notebook-ui:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-notebook-ui/**'
+
+pkg:syft-enclave:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-enclave/**'
+
+pkg:syft-rds:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-rds/**'
+
+pkg:syft-migration:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-migration/**'
+
+pkg:syft-restrict:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/syft-restrict/**'

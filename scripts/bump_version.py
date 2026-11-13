@@ -1,0 +1,122 @@
+"""Bump the version of one package, and update the packages that depend on it.
+
+Usage:
+    python scripts/bump_version.py <package-name> <patch|minor|major>
+
+The script writes the new version into the pyproject.toml of the package. It
+then writes a version pin for the package into each pyproject.toml that depends
+on it.
+
+A pin names the version that was in the file before this run, not the new one. A
+release publishes the version on the branch and bumps the version after that, so
+the earlier version is the one PyPI has. A pin on the new version names a
+version that PyPI does not hold yet, and an install of a dependent then fails.
+
+The script prints two lines:
+
+- Line 1: the new version.
+- Line 2: the modified pyproject.toml files, separated by spaces.
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+import tomllib
+from packaging.version import Version
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def find_all_pyproject_files() -> list[Path]:
+    """Find root and all packages/*/pyproject.toml files."""
+    files = []
+    root = REPO_ROOT / "pyproject.toml"
+    if root.exists():
+        files.append(root)
+    for p in sorted((REPO_ROOT / "packages").glob("*/pyproject.toml")):
+        files.append(p)
+    return files
+
+
+def find_target_pyproject(package_name: str) -> Path:
+    """Find the pyproject.toml whose project.name matches package_name."""
+    for path in find_all_pyproject_files():
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        if data.get("project", {}).get("name") == package_name:
+            return path
+    raise SystemExit(f"Package '{package_name}' not found in any pyproject.toml")
+
+
+def bump_version(current: Version, bump_type: str) -> Version:
+    if bump_type == "major":
+        return Version(f"{current.major + 1}.0.0")
+    elif bump_type == "minor":
+        return Version(f"{current.major}.{current.minor + 1}.0")
+    else:
+        return Version(f"{current.major}.{current.minor}.{current.micro + 1}")
+
+
+def update_target_version(path: Path, bump_type: str) -> Version:
+    """Bump the version field in the target pyproject.toml. Returns new version."""
+    with open(path, "rb") as f:
+        current = Version(tomllib.load(f)["project"]["version"])
+    new = bump_version(current, bump_type)
+    text = path.read_text()
+    text = text.replace(f'version = "{current}"', f'version = "{new}"')
+    path.write_text(text)
+    return new
+
+
+def update_dependents(
+    package_name: str, new_version: Version, target_path: Path
+) -> list[Path]:
+    """Update all pyproject.toml files that depend on package_name. Returns modified paths."""
+    modified = []
+    pattern = re.compile(
+        rf'"({re.escape(package_name)})'  # package name
+        rf'(?:[><=!]=?[^"]*)?'  # optional version specifier
+        rf'"'  # closing quote
+        rf"(?!\s*=)"  # not a TOML key (e.g. in [tool.uv.sources])
+    )
+
+    def replacement(match: re.Match) -> str:
+        # Keep a `>=` floor as a floor; anything else becomes an exact pin.
+        operator = ">=" if match.group(0).startswith(f'"{package_name}>=') else "=="
+        return f'"{package_name}{operator}{new_version}"'
+
+    for path in find_all_pyproject_files():
+        if path == target_path:
+            continue
+        text = path.read_text()
+        new_text = pattern.sub(replacement, text)
+        if new_text != text:
+            path.write_text(new_text)
+            modified.append(path)
+    return modified
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Bump package version with dependency propagation"
+    )
+    parser.add_argument("package_name", help="Package name (e.g. syft-perms)")
+    parser.add_argument("bump_type", choices=["major", "minor", "patch"])
+    args = parser.parse_args()
+
+    target_path = find_target_pyproject(args.package_name)
+    with open(target_path, "rb") as f:
+        published_version = Version(tomllib.load(f)["project"]["version"])
+    new_version = update_target_version(target_path, args.bump_type)
+    modified_deps = update_dependents(args.package_name, published_version, target_path)
+
+    all_modified = [target_path] + modified_deps
+    relative_paths = [str(p.relative_to(REPO_ROOT)) for p in all_modified]
+
+    print(new_version)
+    print(" ".join(relative_paths))
+
+
+if __name__ == "__main__":
+    main()

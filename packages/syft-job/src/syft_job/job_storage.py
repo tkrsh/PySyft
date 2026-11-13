@@ -1,0 +1,327 @@
+import logging
+import shutil
+from pathlib import Path
+from typing import Callable, Iterator, Optional
+
+from syft_migration import (
+    MigratableObject,
+    MigrationError,
+    MigrationRegistry,
+    MigrationService,
+    ProtocolSchema,
+)
+from syft_perms import SyftPermContext
+
+from .config import SyftJobConfig, is_protocol_dir_name
+from .read_permissions import OUTPUTS, RUN_FILES
+from .job_ref import JobRef, JobStateNotFoundError, RequestRef
+from .migrations.registry import JOB_PROTOCOL_VERSION, job_registry
+from .models import JobState, JobSubmissionMetadata, RequestMetadata
+from .protocolcodecs import CODECS, ProtocolCodec
+from .submission import (
+    OWNER_RECORD_FILENAME,
+    REQUEST_FILE_NAME,
+    OwnerJobRecord,
+    claim_owner_record,
+    read_owner_record,
+    write_owner_record,
+)
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["JobRef", "JobStateNotFoundError", "JobStorage"]
+
+# The files of a run that a new run deletes, with their grants. Only the
+# outputs are a folder.
+RUN_ARTIFACTS = RUN_FILES
+
+
+def _no_peer_schema(peer_email: str) -> Optional[ProtocolSchema]:
+    """No peer schema is known: the default when syft passes no lookup."""
+    return None
+
+
+class JobStorage:
+    """Job filesystem IO and path resolution, delegating disk layout to codecs.
+
+    JobStorage owns migration: reads upgrade objects to the latest registered
+    version in memory; writes downgrade them to what the reading peer understands.
+    Each on-disk storage format lives behind a ProtocolCodec, selected by the
+    protocol version (from a job's on-disk layout for reads; the negotiated
+    version for new submissions). The last codec is the current protocol.
+    """
+
+    def __init__(
+        self,
+        config: SyftJobConfig,
+        registry: MigrationRegistry = job_registry,
+        peer_schema: Optional[Callable[[str], Optional[ProtocolSchema]]] = None,
+    ) -> None:
+        self.config = config
+        self.registry = registry
+        self.service = MigrationService(registry=registry)
+        # peer email -> the job ProtocolSchema it advertises, or None when not
+        # known; syft looks it up in the peer store on each call. Peers without
+        # a schema are assumed to run the current protocol.
+        self.peer_schema = peer_schema or _no_peer_schema
+        self.codecs = [cls(config) for cls in CODECS]
+
+    @property
+    def _codec_by_protocol_version(self) -> dict[str, ProtocolCodec]:
+        # protocol version -> codec; one codec may serve several versions.
+        return {
+            protocol_version: codec
+            for codec in self.codecs
+            for protocol_version in codec.protocol_versions
+        }
+
+    def _codec_for(self, protocol_version: str) -> ProtocolCodec:
+        codec = self._codec_by_protocol_version.get(protocol_version)
+        if codec is None:
+            raise MigrationError(
+                f"No codec for job protocol version {protocol_version!r}"
+            )
+        return codec
+
+    # -- peers / protocol ----------------------------------------------------
+    def negotiated_protocol_version_for_peer(
+        self, peer_email: str, raise_on_unknown: bool = True
+    ) -> str:
+        """The job protocol version to speak with ``peer_email``.
+
+        Negotiated as the minimum of our own protocol version and the peer's,
+        so both sides use a version they can read. The result must also be at or
+        above the floor of each side, or the negotiation raises. A peer without a
+        known schema raises by default; with ``raise_on_unknown=False`` it is
+        assumed to run the current protocol.
+        """
+        schema = self.peer_schema(peer_email)
+        if schema is not None:
+            return self.registry.infer_protocol_version_to_use(schema)
+        if raise_on_unknown:
+            raise MigrationError(
+                f"No job protocol schema known for peer {peer_email!r}"
+            )
+        # raise_on_unknown=False skips the refusal of a peer with an unknown
+        # version. A peer that speaks an earlier protocol does not scan this
+        # layout. It never sees the job.
+        logger.warning(
+            f"No job protocol schema known for peer {peer_email!r}. This client "
+            f"writes job protocol {JOB_PROTOCOL_VERSION}. A peer that speaks an "
+            "earlier protocol will not see this job."
+        )
+        return JOB_PROTOCOL_VERSION
+
+    def _get_write_target_schema(
+        self, ref: JobRef, reader_email: str
+    ) -> ProtocolSchema:
+        """The schema to downgrade to before writing for ``reader_email``.
+
+        The job's own layout (``ref.protocol_version``) decides the path and
+        format; a known peer schema only refines the object versions when it
+        speaks the same protocol version.
+        """
+        schema = self.peer_schema(reader_email)
+        if schema is not None and schema.version == ref.protocol_version:
+            return schema
+        return self.registry.schema_for_protocol_version(ref.protocol_version)
+
+    # -- path resolution -------------------------------------------------------
+    def submission_dir(self, ref: JobRef) -> Path:
+        return self._codec_for(ref.protocol_version).submission_dir(ref)
+
+    def request_dir(self, ref: RequestRef) -> Path:
+        return self._codec_for(ref.protocol_version).request_dir(ref)
+
+    def review_dir(self, ref: JobRef) -> Path:
+        return self._codec_for(ref.protocol_version).review_dir(ref)
+
+    def reset_run(self, ref: JobRef) -> list[str]:
+        """Delete the files of the last run of ``ref``, and every grant on them.
+
+        Returns the names it deleted. A grant can sit in a permission file above
+        the job folder and outlive the file, so each grant goes on its own. A
+        file of the next run then starts with no recipient.
+        """
+        datasite = self.config.syftbox_folder / ref.datasite_email
+        modifier = SyftPermContext(datasite=datasite).modifier
+        deleted = []
+        for name in RUN_ARTIFACTS:
+            path = self.review_dir(ref) / name
+            modifier.remove_all_rules(
+                str(path.relative_to(datasite)), is_folder=name == OUTPUTS
+            )
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            else:
+                continue
+            deleted.append(name)
+        return deleted
+
+    # -- owner record (owner side, in review/ with no grant) ------------------------
+    def owner_record_path(self, ref: JobRef) -> Path:
+        return self.review_dir(ref) / OWNER_RECORD_FILENAME
+
+    def read_owner_record(self, ref: JobRef) -> Optional[OwnerJobRecord]:
+        return read_owner_record(self.owner_record_path(ref))
+
+    def claim_owner_record(self, ref: JobRef, record: OwnerJobRecord) -> bool:
+        return claim_owner_record(self.owner_record_path(ref), record)
+
+    def write_owner_record(self, ref: JobRef, record: OwnerJobRecord) -> None:
+        write_owner_record(self.owner_record_path(ref), record)
+
+    def new_submission_ref(self, do_email: str, job_name: str) -> JobRef:
+        """A ref for submitting a new job to ``do_email``."""
+        return JobRef(
+            datasite_email=do_email,
+            ds_email=self.config.current_user_email,
+            job_name=job_name,
+            # Peers without a known schema are assumed to run the current
+            # protocol.
+            protocol_version=self.negotiated_protocol_version_for_peer(
+                do_email, raise_on_unknown=False
+            ),
+        )
+
+    def new_request_ref(self, do_email: str, job_name: str) -> RequestRef:
+        """A ref for calling an api of ``do_email``; the job it becomes is named job_name."""
+        job_ref = self.new_submission_ref(do_email, job_name)
+        return RequestRef(
+            job_ref.datasite_email,
+            job_ref.ds_email,
+            job_ref.job_name,
+            job_ref.protocol_version,
+        )
+
+    # -- naming ------------------------------------------------------------------
+    @staticmethod
+    def validate_job_name(job_name: str) -> None:
+        if is_protocol_dir_name(job_name):
+            raise ValueError(
+                f"Job name {job_name!r} is reserved for protocol version directories"
+            )
+        if "@" in job_name:
+            # An '@' marks a datasite email in JobsList.__getitem__, which is
+            # how jobs["do@x.org"]["analysis"] tells the two keys apart.
+            raise ValueError(f"Job name {job_name!r} cannot contain '@'")
+
+    # -- scanning (union over all protocol layouts) -------------------------------
+    def iter_submission_refs(self, datasite_email: str) -> Iterator[JobRef]:
+        """Yield a ref per job under app_data/job/inbox/, across all codecs."""
+        for codec in self.codecs:
+            yield from codec.iter_submission_refs(datasite_email)
+
+    def iter_request_refs(self, datasite_email: str) -> Iterator[RequestRef]:
+        """Yield a ref per api call under app_data/job/requests/, across all codecs."""
+        for codec in self.codecs:
+            yield from codec.iter_request_refs(datasite_email)
+
+    def iter_review_refs(self, datasite_email: str) -> Iterator[JobRef]:
+        """Yield a ref per job under app_data/job/review/, across all codecs."""
+        for codec in self.codecs:
+            yield from codec.iter_review_refs(datasite_email)
+
+    def find_submission_ref(
+        self, datasite_email: str, job_name: str, ds_email: Optional[str] = None
+    ) -> JobRef:
+        """The unique inbox/<ds_email>/[v<n>/]<job_name>/ ref; ``ds_email`` disambiguates."""
+        matches = [
+            ref
+            for ref in self.iter_submission_refs(datasite_email)
+            if ref.job_name == job_name
+            and (ds_email is None or ref.ds_email == ds_email)
+        ]
+        if not matches:
+            raise FileNotFoundError(f"Job '{job_name}' not found")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple jobs named '{job_name}' found; pass user to disambiguate"
+            )
+        return matches[0]
+
+    # -- model IO ---------------------------------------------------------------
+    def read_submission(self, ref: JobRef) -> JobSubmissionMetadata:
+        """Load a submission's config.yaml, upgraded to the latest version."""
+        codec = self._codec_for(ref.protocol_version)
+        data = codec.read(codec.submission_metadata_path(ref), "JobSubmissionMetadata")
+        # Identity comes from the path (JobRef), never the DS-writable file.
+        data.update(
+            {
+                "submitted_by": ref.ds_email,
+                "datasite_email": ref.datasite_email,
+                "name": ref.job_name,
+            }
+        )
+        return self._upgrade(data, "JobSubmissionMetadata")
+
+    def read_state(self, ref: JobRef) -> JobState:
+        """Load a job's state.yaml, upgraded to the latest version.
+
+        Raises JobStateNotFoundError if the state.yaml does not exist.
+        """
+        codec = self._codec_for(ref.protocol_version)
+        path = codec.state_path(ref)
+        if not path.exists():
+            raise JobStateNotFoundError(f"Job state not found for {ref.job_name}")
+        return self._upgrade(codec.read(path, "JobState"), "JobState")
+
+    def write_submission(
+        self,
+        ref: JobRef,
+        metadata: JobSubmissionMetadata,
+        folder: Optional[Path] = None,
+    ) -> Path:
+        """Write config.yaml in the version/format the peer can read.
+
+        folder writes it into a job that is still being built elsewhere.
+        """
+        codec = self._codec_for(ref.protocol_version)
+        path = (
+            folder / codec.submission_marker
+            if folder is not None
+            else codec.submission_metadata_path(ref)
+        )
+        return self._write(codec, path, metadata, ref, reader_email=ref.datasite_email)
+
+    def read_request(self, ref: RequestRef) -> RequestMetadata:
+        """Load a request's request.yaml, upgraded to the latest version."""
+        codec = self._codec_for(ref.protocol_version)
+        data = codec.read(codec.request_dir(ref) / REQUEST_FILE_NAME, "RequestMetadata")
+        return self._upgrade(data, "RequestMetadata")
+
+    def write_request(self, ref: RequestRef, metadata: RequestMetadata) -> Path:
+        """Write request.yaml in the version/format the DO can read."""
+        codec = self._codec_for(ref.protocol_version)
+        path = codec.request_dir(ref) / REQUEST_FILE_NAME
+        return self._write(
+            codec, path, metadata, ref.job_ref, reader_email=ref.datasite_email
+        )
+
+    def write_state(self, ref: JobRef, state: JobState) -> Path:
+        """Write state.yaml in the version/format the peer can read."""
+        codec = self._codec_for(ref.protocol_version)
+        return self._write(
+            codec, codec.state_path(ref), state, ref, reader_email=ref.ds_email
+        )
+
+    # -- internals -----------------------------------------------------------------
+    def _upgrade(self, data: dict, canonical_name: str) -> MigratableObject:
+        obj = self.service.load(data)
+        return self.service.migrate(obj, self.registry.latest_version(canonical_name))
+
+    def _write(
+        self,
+        codec: ProtocolCodec,
+        path: Path,
+        obj: MigratableObject,
+        ref: JobRef,
+        reader_email: str,
+    ) -> Path:
+        """Downgrade ``obj`` to the reader's version, then let the codec persist it."""
+        schema = self._get_write_target_schema(ref, reader_email=reader_email)
+        downgraded = self.service.migrate_to_schema(obj, schema)
+        codec.write(path, downgraded)
+        return path

@@ -1,0 +1,82 @@
+name: CD - Syft Permissions
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: Version bump type
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+  workflow_call:
+    inputs:
+      bump_type:
+        type: string
+        required: true
+
+concurrency:
+  group: 'CD - Syft Permissions'
+  cancel-in-progress: false
+
+jobs:
+  deploy-syft-permissions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # The branch already holds the version to release. The bump happens after
+      # the publish, so the version on the branch always names an unreleased
+      # version while people develop.
+      - name: Read the version to release
+        run: |
+          # Only this branch and no tags: a bare `git pull` fetches every old tag.
+          git pull --ff-only --no-tags origin "${{ github.ref_name }}"
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('packages/syft-permissions/pyproject.toml','rb'))['project']['version'])")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Releasing syft-permissions $VERSION"
+
+      - name: Build package
+        working-directory: packages/syft-permissions
+        run: uv build --out-dir dist
+
+      - name: Publish to PyPI
+        working-directory: packages/syft-permissions
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_PASS_SYFT_PERMISSIONS }}
+        run: uvx twine upload --verbose dist/*
+
+      # The tag must name the published version, so it is created before the bump.
+      # The tag is annotated and pushed explicitly: `--follow-tags` only pushes
+      # annotated tags, so a lightweight tag would never reach origin. The bump
+      # and the tag are pushed together (--atomic), so a re-run never finds one
+      # without the other.
+      - name: Tag the release, then bump for the next one
+        run: |
+          git tag -a "syft-permissions/v${{ env.VERSION }}" -m "syft-permissions v${{ env.VERSION }}"
+          pip install packaging
+          OUTPUT=$(python scripts/bump_version.py syft-permissions ${{ inputs.bump_type }})
+          NEXT=$(echo "$OUTPUT" | sed -n '1p')
+          MODIFIED=$(echo "$OUTPUT" | sed -n '2p')
+          git add $MODIFIED
+          git commit -m "Bump syft-permissions to $NEXT for the next release"
+          git push --atomic origin HEAD "refs/tags/syft-permissions/v${{ env.VERSION }}"
